@@ -33,10 +33,9 @@ import (
 
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
-	"google.golang.org/protobuf/types/known/timestamppb"
-
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/service/history/tasks"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
@@ -50,6 +49,27 @@ type (
 	// The intention is to let different persistence implementation(SQL,Cassandra/etc) share some common logic
 	// Right now the only common part is serialization/deserialization.
 	// ////////////////////////////////////////////////////////////////////
+
+	// DataStoreFactory is a low level interface to be implemented by a datastore
+	// Examples of datastores are cassandra, mysql etc
+	DataStoreFactory interface {
+		// Close closes the factory
+		Close()
+		// NewTaskStore returns a new task store
+		NewTaskStore() (TaskStore, error)
+		// NewShardStore returns a new shard store
+		NewShardStore() (ShardStore, error)
+		// NewMetadataStore returns a new metadata store
+		NewMetadataStore() (MetadataStore, error)
+		// NewExecutionStore returns a new execution store
+		NewExecutionStore() (ExecutionStore, error)
+		NewQueue(queueType QueueType) (Queue, error)
+		NewQueueV2() (QueueV2, error)
+		// NewClusterMetadataStore returns a new metadata store
+		NewClusterMetadataStore() (ClusterMetadataStore, error)
+		// NewNexusEndpointStore returns a new nexus service store
+		NewNexusEndpointStore() (NexusEndpointStore, error)
+	}
 
 	// ShardStore is a lower level of ShardManager
 	ShardStore interface {
@@ -72,7 +92,6 @@ type (
 		DeleteTaskQueue(ctx context.Context, request *DeleteTaskQueueRequest) error
 		CreateTasks(ctx context.Context, request *InternalCreateTasksRequest) (*CreateTasksResponse, error)
 		GetTasks(ctx context.Context, request *GetTasksRequest) (*InternalGetTasksResponse, error)
-		CompleteTask(ctx context.Context, request *CompleteTaskRequest) error
 		CompleteTasksLessThan(ctx context.Context, request *CompleteTasksLessThanRequest) (int, error)
 		GetTaskQueueUserData(ctx context.Context, request *GetTaskQueueUserDataRequest) (*InternalGetTaskQueueUserDataResponse, error)
 		UpdateTaskQueueUserData(ctx context.Context, request *InternalUpdateTaskQueueUserDataRequest) error
@@ -182,13 +201,14 @@ type (
 		GetDLQAckLevels(ctx context.Context) (*InternalQueueMetadata, error)
 	}
 
-	// NexusIncomingServiceStore is a store for managing Nexus services
-	NexusIncomingServiceStore interface {
+	// NexusEndpointStore is a store for managing Nexus endpoints
+	NexusEndpointStore interface {
 		Closeable
 		GetName() string
-		CreateOrUpdateNexusIncomingService(ctx context.Context, request *InternalCreateOrUpdateNexusIncomingServiceRequest) error
-		ListNexusIncomingServices(ctx context.Context, request *ListNexusIncomingServicesRequest) (*InternalListNexusIncomingServicesResponse, error)
-		DeleteNexusIncomingService(ctx context.Context, request *DeleteNexusIncomingServiceRequest) error
+		CreateOrUpdateNexusEndpoint(ctx context.Context, request *InternalCreateOrUpdateNexusEndpointRequest) error
+		DeleteNexusEndpoint(ctx context.Context, request *DeleteNexusEndpointRequest) error
+		GetNexusEndpoint(ctx context.Context, request *GetNexusEndpointRequest) (*InternalNexusEndpoint, error)
+		ListNexusEndpoints(ctx context.Context, request *ListNexusEndpointsRequest) (*InternalListNexusEndpointsResponse, error)
 	}
 
 	// QueueMessage is the message that stores in the queue
@@ -209,8 +229,8 @@ type (
 	// create the shard with the returned value.
 	InternalGetOrCreateShardRequest struct {
 		ShardID          int32
-		CreateShardInfo  func() (rangeID int64, shardInfo *commonpb.DataBlob, err error)
-		LifecycleContext context.Context // cancelled when shard is unloaded
+		CreateShardInfo  func() (rangeID int64, shardInfo *commonpb.DataBlob, err error) `json:"-"` // cannot be serialized otherwise
+		LifecycleContext context.Context                                                 // cancelled when shard is unloaded
 	}
 
 	// InternalGetOrCreateShardResponse is the response to GetShard
@@ -406,7 +426,6 @@ type (
 
 		NamespaceID string
 		WorkflowID  string
-		RunID       string
 
 		Tasks map[tasks.Category][]InternalHistoryTask
 	}
@@ -539,8 +558,8 @@ type (
 
 	// InternalForkHistoryBranchRequest is used to fork a history branch
 	InternalForkHistoryBranchRequest struct {
-		// The base branch token
-		ForkBranchToken []byte
+		// The new branch token to fork to
+		NewBranchToken []byte
 		// The base branch to fork from
 		ForkBranchInfo *persistencespb.HistoryBranch
 		// Serialized TreeInfo
@@ -742,21 +761,21 @@ type (
 		RecordExpiry time.Time
 	}
 
-	InternalNexusIncomingService struct {
-		ServiceID string
-		Version   int64
-		Data      *commonpb.DataBlob
+	InternalNexusEndpoint struct {
+		ID      string
+		Version int64
+		Data    *commonpb.DataBlob
 	}
 
-	InternalCreateOrUpdateNexusIncomingServiceRequest struct {
+	InternalCreateOrUpdateNexusEndpointRequest struct {
 		LastKnownTableVersion int64
-		Service               InternalNexusIncomingService
+		Endpoint              InternalNexusEndpoint
 	}
 
-	InternalListNexusIncomingServicesResponse struct {
+	InternalListNexusEndpointsResponse struct {
 		TableVersion  int64
 		NextPageToken []byte
-		Services      []InternalNexusIncomingService
+		Endpoints     []InternalNexusEndpoint
 	}
 
 	// QueueV2 is an interface for a generic FIFO queue. It should eventually replace the Queue interface. Why do we

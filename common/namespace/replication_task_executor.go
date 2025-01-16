@@ -32,7 +32,6 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	replicationpb "go.temporal.io/api/replication/v1"
 	"go.temporal.io/api/serviceerror"
-
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	replicationspb "go.temporal.io/server/api/replication/v1"
@@ -64,10 +63,10 @@ var (
 	ErrNameUUIDCollision = serviceerror.NewInvalidArgument("namespace replication encountered name / UUID collision")
 )
 
-// NOTE: the counterpart of namespace replication transmission logic is in service/fropntend package
+// NOTE: the counterpart of namespace replication transmission logic is in service/frontend package
 
 type (
-	// ReplicationTaskExecutor is the interface which is to execute namespace replication task
+	// ReplicationTaskExecutor is the interface for executing namespace replication tasks
 	ReplicationTaskExecutor interface {
 		Execute(ctx context.Context, task *replicationspb.NamespaceTaskAttributes) error
 	}
@@ -79,7 +78,7 @@ type (
 	}
 )
 
-// NewReplicationTaskExecutor create a new instance of namespace replicator
+// NewReplicationTaskExecutor creates a new instance of namespace replicator
 func NewReplicationTaskExecutor(
 	currentCluster string,
 	metadataManagerV2 persistence.MetadataManager,
@@ -204,7 +203,7 @@ func (h *namespaceReplicationTaskExecutorImpl) handleNamespaceCreationReplicatio
 					tag.WorkflowNamespaceID(resp.Namespace.Info.Id),
 					tag.NewStringTag("Task Namespace Id", task.GetId()),
 					tag.NewStringTag("Task Namepsace Info Id", task.Info.GetId()),
-					tag.NewErrorTag(err))
+					tag.Error(err))
 				return ErrNameUUIDCollision
 			}
 		case *serviceerror.NamespaceNotFound:
@@ -216,7 +215,7 @@ func (h *namespaceReplicationTaskExecutorImpl) handleNamespaceCreationReplicatio
 				"namespace replication encountered error during NamespaceCreationReplicationTask",
 				tag.WorkflowNamespace(task.Info.GetName()),
 				tag.WorkflowNamespaceID(task.Info.GetId()),
-				tag.NewErrorTag(err))
+				tag.Error(err))
 			return err
 		}
 
@@ -230,7 +229,7 @@ func (h *namespaceReplicationTaskExecutorImpl) handleNamespaceCreationReplicatio
 					"namespace replication encountered name collision during NamespaceCreationReplicationTask",
 					tag.WorkflowNamespace(resp.Namespace.Info.Name),
 					tag.NewStringTag("Task Namespace Name", task.Info.GetName()),
-					tag.NewErrorTag(err))
+					tag.Error(err))
 				return ErrNameUUIDCollision
 			}
 		case *serviceerror.NamespaceNotFound:
@@ -358,14 +357,14 @@ func ConvertClusterReplicationConfigFromProto(
 }
 
 func convertFailoverHistoryToPersistenceProto(failoverHistory []*replicationpb.FailoverStatus) []*persistencespb.FailoverStatus {
-	var persistencePb []*persistencespb.FailoverStatus
+	var res []*persistencespb.FailoverStatus
 	for _, status := range failoverHistory {
-		persistencePb = append(persistencePb, &persistencespb.FailoverStatus{
+		res = append(res, &persistencespb.FailoverStatus{
 			FailoverTime:    status.GetFailoverTime(),
 			FailoverVersion: status.GetFailoverVersion(),
 		})
 	}
-	return persistencePb
+	return res
 }
 
 func (h *namespaceReplicationTaskExecutorImpl) validateNamespaceStatus(input enumspb.NamespaceState) error {

@@ -25,6 +25,7 @@
 package configs
 
 import (
+	"math"
 	"time"
 
 	"go.temporal.io/server/common/dynamicconfig"
@@ -35,6 +36,16 @@ import (
 const (
 	// OperatorPriority is used to give precedence to calls coming from web UI or tctl
 	OperatorPriority = 0
+)
+
+const (
+	// These names do not map to an underlying gRPC service. This format is used for consistency with the
+	// gRPC API names on which the authorizer - the consumer of this string - may depend.
+	OpenAPIV3APIName                                = "/temporal.api.openapi.v1.OpenAPIService/GetOpenAPIV3Docs"
+	OpenAPIV2APIName                                = "/temporal.api.openapi.v1.OpenAPIService/GetOpenAPIV2Docs"
+	DispatchNexusTaskByNamespaceAndTaskQueueAPIName = "/temporal.api.nexusservice.v1.NexusService/DispatchByNamespaceAndTaskQueue"
+	DispatchNexusTaskByEndpointAPIName              = "/temporal.api.nexusservice.v1.NexusService/DispatchByEndpoint"
+	CompleteNexusOperation                          = "/temporal.api.nexusservice.v1.NexusService/CompleteNexusOperation"
 )
 
 var (
@@ -54,8 +65,12 @@ var (
 		"/temporal.api.workflowservice.v1.WorkflowService/GetWorkflowExecutionHistory": 1,
 		"/temporal.api.workflowservice.v1.WorkflowService/PollNexusTaskQueue":          1,
 
-		// DispatchNexusTask is potentially long running, it's classified in the same bucket as QueryWorkflow.
-		"/temporal.api.nexusservice.v1.NexusService/DispatchNexusTask": 1,
+		// potentially long-running, depending on the operations
+		"/temporal.api.workflowservice.v1.WorkflowService/ExecuteMultiOperation": 1,
+
+		// Dispatching a Nexus task is a potentially long running RPC, it's classified in the same bucket as QueryWorkflow.
+		DispatchNexusTaskByNamespaceAndTaskQueueAPIName: 1,
+		DispatchNexusTaskByEndpointAPIName:              1,
 	}
 
 	// APIToPriority determines common API priorities.
@@ -75,9 +90,11 @@ var (
 		"/temporal.api.workflowservice.v1.WorkflowService/SignalWithStartWorkflowExecution": 1,
 		"/temporal.api.workflowservice.v1.WorkflowService/StartWorkflowExecution":           1,
 		"/temporal.api.workflowservice.v1.WorkflowService/UpdateWorkflowExecution":          1,
+		"/temporal.api.workflowservice.v1.WorkflowService/ExecuteMultiOperation":            1,
 		"/temporal.api.workflowservice.v1.WorkflowService/CreateSchedule":                   1,
 		"/temporal.api.workflowservice.v1.WorkflowService/StartBatchOperation":              1,
-		"/temporal.api.nexusservice.v1.NexusService/DispatchNexusTask":                      1,
+		DispatchNexusTaskByNamespaceAndTaskQueueAPIName:                                     1,
+		DispatchNexusTaskByEndpointAPIName:                                                  1,
 
 		// P2: Change State APIs
 		"/temporal.api.workflowservice.v1.WorkflowService/RequestCancelWorkflowExecution": 2,
@@ -89,16 +106,25 @@ var (
 		"/temporal.api.workflowservice.v1.WorkflowService/PatchSchedule":                  2,
 		"/temporal.api.workflowservice.v1.WorkflowService/DeleteSchedule":                 2,
 		"/temporal.api.workflowservice.v1.WorkflowService/StopBatchOperation":             2,
+		"/temporal.api.workflowservice.v1.WorkflowService/UpdateActivityOptionsById":      2,
+		"/temporal.api.workflowservice.v1.WorkflowService/PauseActivityById":              2,
+		"/temporal.api.workflowservice.v1.WorkflowService/UnpauseActivityById":            2,
+		"/temporal.api.workflowservice.v1.WorkflowService/ResetActivityById":              2,
+		"/temporal.api.workflowservice.v1.WorkflowService/UpdateWorkflowExecutionOptions": 2,
+		"/temporal.api.workflowservice.v1.WorkflowService/SetCurrentDeployment":           2,
 
 		// P3: Status Querying APIs
 		"/temporal.api.workflowservice.v1.WorkflowService/DescribeWorkflowExecution":     3,
 		"/temporal.api.workflowservice.v1.WorkflowService/DescribeTaskQueue":             3,
 		"/temporal.api.workflowservice.v1.WorkflowService/GetWorkerBuildIdCompatibility": 3,
+		"/temporal.api.workflowservice.v1.WorkflowService/GetWorkerVersioningRules":      3,
 		"/temporal.api.workflowservice.v1.WorkflowService/ListTaskQueuePartitions":       3,
 		"/temporal.api.workflowservice.v1.WorkflowService/QueryWorkflow":                 3,
 		"/temporal.api.workflowservice.v1.WorkflowService/DescribeSchedule":              3,
 		"/temporal.api.workflowservice.v1.WorkflowService/ListScheduleMatchingTimes":     3,
 		"/temporal.api.workflowservice.v1.WorkflowService/DescribeBatchOperation":        3,
+		"/temporal.api.workflowservice.v1.WorkflowService/DescribeDeployment":            3,
+		"/temporal.api.workflowservice.v1.WorkflowService/GetCurrentDeployment":          3,
 
 		// P4: Progress APIs
 		"/temporal.api.workflowservice.v1.WorkflowService/RecordActivityTaskHeartbeat":      4,
@@ -114,6 +140,7 @@ var (
 		"/temporal.api.workflowservice.v1.WorkflowService/RespondQueryTaskCompleted":        4,
 		"/temporal.api.workflowservice.v1.WorkflowService/RespondNexusTaskCompleted":        4,
 		"/temporal.api.workflowservice.v1.WorkflowService/RespondNexusTaskFailed":           4,
+		CompleteNexusOperation: 4,
 
 		// P5: Poll APIs and other low priority APIs
 		"/temporal.api.workflowservice.v1.WorkflowService/PollWorkflowTaskQueue":              5,
@@ -121,10 +148,15 @@ var (
 		"/temporal.api.workflowservice.v1.WorkflowService/PollWorkflowExecutionUpdate":        5,
 		"/temporal.api.workflowservice.v1.WorkflowService/PollNexusTaskQueue":                 5,
 		"/temporal.api.workflowservice.v1.WorkflowService/ResetStickyTaskQueue":               5,
+		"/temporal.api.workflowservice.v1.WorkflowService/ShutdownWorker":                     5,
 		"/temporal.api.workflowservice.v1.WorkflowService/GetWorkflowExecutionHistoryReverse": 5,
+
+		// P6: Informational API that aren't required for the temporal service to function
+		OpenAPIV3APIName: 6,
+		OpenAPIV2APIName: 6,
 	}
 
-	ExecutionAPIPrioritiesOrdered = []int{0, 1, 2, 3, 4, 5}
+	ExecutionAPIPrioritiesOrdered = []int{0, 1, 2, 3, 4, 5, 6}
 
 	VisibilityAPIToPriority = map[string]int{
 		"/temporal.api.workflowservice.v1.WorkflowService/CountWorkflowExecutions":        1,
@@ -135,9 +167,12 @@ var (
 		"/temporal.api.workflowservice.v1.WorkflowService/ListArchivedWorkflowExecutions": 1,
 
 		// APIs that rely on visibility
-		"/temporal.api.workflowservice.v1.WorkflowService/GetWorkerTaskReachability": 1,
-		"/temporal.api.workflowservice.v1.WorkflowService/ListSchedules":             1,
-		"/temporal.api.workflowservice.v1.WorkflowService/ListBatchOperations":       1,
+		"/temporal.api.workflowservice.v1.WorkflowService/GetWorkerTaskReachability":         1,
+		"/temporal.api.workflowservice.v1.WorkflowService/ListSchedules":                     1,
+		"/temporal.api.workflowservice.v1.WorkflowService/ListBatchOperations":               1,
+		"/temporal.api.workflowservice.v1.WorkflowService/DescribeTaskQueueWithReachability": 1, // note this isn't a real method name
+		"/temporal.api.workflowservice.v1.WorkflowService/ListDeployments":                   1,
+		"/temporal.api.workflowservice.v1.WorkflowService/GetDeploymentReachability":         1,
 	}
 
 	VisibilityAPIPrioritiesOrdered = []int{0, 1}
@@ -149,6 +184,7 @@ var (
 		"/temporal.api.workflowservice.v1.WorkflowService/RegisterNamespace":                1,
 		"/temporal.api.workflowservice.v1.WorkflowService/UpdateNamespace":                  1,
 		"/temporal.api.workflowservice.v1.WorkflowService/UpdateWorkerBuildIdCompatibility": 2,
+		"/temporal.api.workflowservice.v1.WorkflowService/UpdateWorkerVersioningRules":      2,
 	}
 
 	NamespaceReplicationInducingAPIPrioritiesOrdered = []int{0, 1, 2}
@@ -157,7 +193,7 @@ var (
 type (
 	NamespaceRateBurstImpl struct {
 		namespaceName string
-		rateFn        dynamicconfig.FloatPropertyFnWithNamespaceFilter
+		rateFn        quotas.NamespaceRateFn
 		burstFn       dynamicconfig.IntPropertyFnWithNamespaceFilter
 	}
 
@@ -172,13 +208,15 @@ var _ quotas.RateBurst = (*operatorRateBurstImpl)(nil)
 
 func NewNamespaceRateBurst(
 	namespaceName string,
-	rateFn dynamicconfig.FloatPropertyFnWithNamespaceFilter,
-	burstFn dynamicconfig.IntPropertyFnWithNamespaceFilter,
+	rateFn quotas.NamespaceRateFn,
+	burstRatioFn dynamicconfig.FloatPropertyFnWithNamespaceFilter,
 ) *NamespaceRateBurstImpl {
 	return &NamespaceRateBurstImpl{
 		namespaceName: namespaceName,
 		rateFn:        rateFn,
-		burstFn:       burstFn,
+		burstFn: func(namespace string) int {
+			return max(1, int(math.Ceil(rateFn(namespace)*burstRatioFn(namespace))))
+		},
 	}
 }
 

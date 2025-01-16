@@ -29,22 +29,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/urfave/cli/v2"
 	commonpb "go.temporal.io/api/common/v1"
-	"go.uber.org/multierr"
-	"golang.org/x/exp/slices"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
-
 	"go.temporal.io/server/api/adminservice/v1"
 	commonspb "go.temporal.io/server/api/common/v1"
 	"go.temporal.io/server/common/collection"
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/service/history/tasks"
+	"go.uber.org/multierr"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 type (
@@ -194,6 +193,10 @@ func (ac *DLQV2Service) ReadMessages(c *cli.Context) (err error) {
 			}
 			res, err := adminClient.GetDLQTasks(ctx, request)
 			if err != nil {
+				// If the DLQ does not exist yet, it's effectively empty, so we can safely return without an error.
+				if strings.Contains(err.Error(), "queue not found:") {
+					return nil, nil, nil
+				}
 				return nil, nil, fmt.Errorf("call to GetDLQTasks from ReadMessages failed: %w", err)
 			}
 			return res.DlqTasks, res.NextPageToken, nil

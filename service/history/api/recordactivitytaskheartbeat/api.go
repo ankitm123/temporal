@@ -62,7 +62,6 @@ func Invoke(
 	err = api.GetAndUpdateWorkflowWithNew(
 		ctx,
 		token.Clock,
-		api.BypassMutableStateConsistencyPredicate,
 		definition.NewWorkflowKey(
 			token.NamespaceId,
 			token.WorkflowId,
@@ -97,6 +96,11 @@ func Invoke(
 				(token.GetScheduledEventId() != common.EmptyEventID && token.Attempt != ai.Attempt) ||
 				(token.GetVersion() != common.EmptyVersion && token.Version != ai.Version) {
 				return nil, consts.ErrActivityTaskNotFound
+			}
+
+			// update worker identity if available
+			if req.HeartbeatRequest.Identity != "" {
+				ai.RetryLastWorkerIdentity = req.HeartbeatRequest.Identity
 			}
 
 			cancelRequested = ai.CancelRequested

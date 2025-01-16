@@ -27,13 +27,11 @@ package getworkflowexecutionhistory
 import (
 	"context"
 
-	"go.temporal.io/api/workflowservice/v1"
-
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/serviceerror"
-
+	"go.temporal.io/api/workflowservice/v1"
 	historyspb "go.temporal.io/server/api/history/v1"
 	"go.temporal.io/server/api/historyservice/v1"
 	tokenspb "go.temporal.io/server/api/token/v1"
@@ -171,9 +169,9 @@ func Invoke(
 		continuationToken.PersistenceToken = nil
 	}
 
-	// TODO below is a temporal solution to guard against invalid event batch
-	//  when data inconsistency occurs
-	//  long term solution should check event batch pointing backwards within history store
+	// TODO below is a temporary solution to guard against invalid event batch
+	// when data inconsistency occurs. Long term solution should check event
+	// batch pointing backwards within history store.
 	defer func() {
 		if _, ok := retError.(*serviceerror.DataLoss); ok {
 			api.TrimHistoryNode(

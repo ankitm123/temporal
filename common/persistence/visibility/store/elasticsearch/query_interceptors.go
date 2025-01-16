@@ -25,42 +25,38 @@
 package elasticsearch
 
 import (
+	"fmt"
 	"strconv"
 	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
-
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/persistence/visibility/store/query"
-	"go.temporal.io/server/common/primitives/timestamp"
+	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/searchattribute"
 )
 
 type (
 	nameInterceptor struct {
 		namespace                      namespace.Name
-		index                          string
 		searchAttributesTypeMap        searchattribute.NameTypeMap
 		searchAttributesMapperProvider searchattribute.MapperProvider
 		seenNamespaceDivision          bool
 	}
 
 	valuesInterceptor struct {
-		namespace                      namespace.Name
-		searchAttributesTypeMap        searchattribute.NameTypeMap
-		searchAttributesMapperProvider searchattribute.MapperProvider
+		namespace               namespace.Name
+		searchAttributesTypeMap searchattribute.NameTypeMap
 	}
 )
 
-func newNameInterceptor(
+func NewNameInterceptor(
 	namespaceName namespace.Name,
-	index string,
 	saTypeMap searchattribute.NameTypeMap,
 	searchAttributesMapperProvider searchattribute.MapperProvider,
 ) *nameInterceptor {
 	return &nameInterceptor{
 		namespace:                      namespaceName,
-		index:                          index,
 		searchAttributesTypeMap:        saTypeMap,
 		searchAttributesMapperProvider: searchAttributesMapperProvider,
 	}
@@ -69,15 +65,14 @@ func newNameInterceptor(
 func NewValuesInterceptor(
 	namespaceName namespace.Name,
 	saTypeMap searchattribute.NameTypeMap,
-	searchAttributesMapperProvider searchattribute.MapperProvider,
 ) *valuesInterceptor {
 	return &valuesInterceptor{
-		namespace:                      namespaceName,
-		searchAttributesTypeMap:        saTypeMap,
-		searchAttributesMapperProvider: searchAttributesMapperProvider,
+		namespace:               namespaceName,
+		searchAttributesTypeMap: saTypeMap,
 	}
 }
 
+// TODO: this is invoked for non-ES validation code flow. Needs refactoring
 func (ni *nameInterceptor) Name(name string, usage query.FieldNameUsage) (string, error) {
 	fieldName := name
 	if searchattribute.IsMappable(name) {
@@ -85,10 +80,22 @@ func (ni *nameInterceptor) Name(name string, usage query.FieldNameUsage) (string
 		if err != nil {
 			return "", err
 		}
+
 		if mapper != nil {
 			fieldName, err = mapper.GetFieldName(name, ni.namespace.String())
 			if err != nil {
-				return "", err
+				if name != searchattribute.ScheduleID {
+					return "", err
+				}
+
+				// ScheduleId is a fake SA -- convert to WorkflowId
+				fieldName = searchattribute.WorkflowID
+			} else if name == searchattribute.ScheduleID && name == fieldName {
+				_, isCustom := ni.searchAttributesTypeMap.Custom()[fieldName]
+				if !isCustom {
+					// ScheduleId is a fake SA -- convert to WorkflowId
+					fieldName = searchattribute.WorkflowID
+				}
 			}
 		}
 	}
@@ -123,32 +130,23 @@ func (ni *nameInterceptor) Name(name string, usage query.FieldNameUsage) (string
 	return fieldName, nil
 }
 
-func (vi *valuesInterceptor) Values(fieldName string, values ...interface{}) ([]interface{}, error) {
+func (vi *valuesInterceptor) Values(name string, fieldName string, values ...interface{}) ([]interface{}, error) {
 	fieldType, err := vi.searchAttributesTypeMap.GetType(fieldName)
 	if err != nil {
-		return nil, query.NewConverterError("invalid search attribute: %s", fieldName)
-	}
-
-	name := fieldName
-	if searchattribute.IsMappable(fieldName) {
-		mapper, err := vi.searchAttributesMapperProvider.GetMapper(vi.namespace)
-		if err != nil {
-			return nil, err
-		}
-		if mapper != nil {
-			name, err = mapper.GetAlias(fieldName, vi.namespace.String())
-			if err != nil {
-				return nil, err
-			}
-		}
+		return nil, query.NewConverterError("invalid search attribute: %s", name)
 	}
 
 	var result []interface{}
 	for _, value := range values {
-		value, err = parseSystemSearchAttributeValues(fieldName, value)
+		value, err = parseSystemSearchAttributeValues(name, value)
 		if err != nil {
 			return nil, err
 		}
+
+		if name == searchattribute.ScheduleID && fieldName == searchattribute.WorkflowID {
+			value = primitives.ScheduleWorkflowIDPrefix + fmt.Sprintf("%v", value)
+		}
+
 		value, err = validateValueType(name, value, fieldType)
 		if err != nil {
 			return nil, err
@@ -173,19 +171,12 @@ func parseSystemSearchAttributeValues(name string, value any) (any, error) {
 		}
 	case searchattribute.ExecutionDuration:
 		if durationStr, isString := value.(string); isString {
-			// To support durations passed as golang durations such as "300ms", "-1.5h" or "2h45m".
-			// Valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
-			// Custom timestamp.ParseDuration also supports "d" as additional unit for days.
-			if duration, err := timestamp.ParseDuration(durationStr); err == nil {
-				value = duration.Nanoseconds()
-			} else {
-				// To support "hh:mm:ss" durations.
-				duration, err := timestamp.ParseHHMMSSDuration(durationStr)
-				if err != nil {
-					return nil, err
-				}
-				value = duration.Nanoseconds()
+			duration, err := query.ParseExecutionDurationStr(durationStr)
+			if err != nil {
+				return nil, query.NewConverterError(
+					"invalid value for search attribute %s: %v (%v)", name, value, err)
 			}
+			value = duration.Nanoseconds()
 		}
 	default:
 	}

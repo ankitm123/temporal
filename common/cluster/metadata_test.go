@@ -28,16 +28,14 @@ import (
 	"testing"
 	"time"
 
-	"go.temporal.io/server/common/dynamicconfig"
-
-	"github.com/golang/mock/gomock"
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-
 	persistencespb "go.temporal.io/server/api/persistence/v1"
+	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/persistence"
+	"go.uber.org/mock/gomock"
 )
 
 type (
@@ -195,6 +193,7 @@ func (s *metadataSuite) Test_RefreshClusterMetadata_Success() {
 						InitialFailoverVersion: 1,
 						HistoryShardCount:      1,
 						ClusterAddress:         uuid.New(),
+						HttpAddress:            uuid.New(),
 					},
 					Version: 1,
 				},
@@ -206,6 +205,7 @@ func (s *metadataSuite) Test_RefreshClusterMetadata_Success() {
 						InitialFailoverVersion: 1,
 						HistoryShardCount:      1,
 						ClusterAddress:         uuid.New(),
+						HttpAddress:            uuid.New(),
 						Tags:                   map[string]string{"test": "test"},
 					},
 					Version: 2,
@@ -218,6 +218,7 @@ func (s *metadataSuite) Test_RefreshClusterMetadata_Success() {
 						InitialFailoverVersion: 2,
 						HistoryShardCount:      2,
 						ClusterAddress:         uuid.New(),
+						HttpAddress:            uuid.New(),
 						Tags:                   map[string]string{"test": "test"},
 					},
 					Version: 2,
@@ -247,6 +248,7 @@ func (s *metadataSuite) Test_ListAllClusterMetadataFromDB_Success() {
 						InitialFailoverVersion: 1,
 						HistoryShardCount:      1,
 						ClusterAddress:         uuid.New(),
+						HttpAddress:            uuid.New(),
 					},
 					Version: 1,
 				},
@@ -266,6 +268,7 @@ func (s *metadataSuite) Test_ListAllClusterMetadataFromDB_Success() {
 						InitialFailoverVersion: 2,
 						HistoryShardCount:      2,
 						ClusterAddress:         uuid.New(),
+						HttpAddress:            uuid.New(),
 					},
 					Version: 2,
 				},

@@ -36,7 +36,6 @@ import (
 	"time"
 
 	"github.com/iancoleman/strcase"
-
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/searchattribute"
@@ -71,6 +70,8 @@ type (
 		SearchAttributes     *VisibilitySearchAttributes
 		ParentWorkflowID     *string
 		ParentRunID          *string
+		RootWorkflowID       string
+		RootRunID            string
 	}
 
 	// VisibilitySelectFilter contains the column names within executions_visibility table that
@@ -150,7 +151,11 @@ func (vsa VisibilitySearchAttributes) Value() (driver.Value, error) {
 	if vsa == nil {
 		return nil, nil
 	}
-	return json.Marshal(vsa)
+	bs, err := json.Marshal(vsa)
+	if err != nil {
+		return nil, err
+	}
+	return string(bs), nil
 }
 
 func ParseCountGroupByRows(rows *sql.Rows, groupBy []string) ([]VisibilityCountRow, error) {

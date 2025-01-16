@@ -27,10 +27,10 @@ package serialization
 import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
-	"google.golang.org/protobuf/proto"
-
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common/codec"
+	"go.temporal.io/server/common/utf8validator"
+	"google.golang.org/protobuf/proto"
 )
 
 func HistoryBranchToBlob(info *persistencespb.HistoryBranch) (*commonpb.DataBlob, error) {
@@ -98,6 +98,11 @@ func ArchivalTaskInfoToBlob(info *persistencespb.ArchivalTaskInfo) (*commonpb.Da
 
 func ArchivalTaskInfoFromBlob(blob []byte, encoding string) (*persistencespb.ArchivalTaskInfo, error) {
 	result := &persistencespb.ArchivalTaskInfo{}
+	return result, proto3Decode(blob, encoding, result)
+}
+
+func OutboundTaskInfoFromBlob(blob []byte, encoding string) (*persistencespb.OutboundTaskInfo, error) {
+	result := &persistencespb.OutboundTaskInfo{}
 	return result, proto3Decode(blob, encoding, result)
 }
 
@@ -169,6 +174,9 @@ func decode(
 }
 
 func proto3Encode(m proto.Message) (*commonpb.DataBlob, error) {
+	if err := utf8validator.Validate(m, utf8validator.SourcePersistence); err != nil {
+		return nil, NewSerializationError(enumspb.ENCODING_TYPE_PROTO3, err)
+	}
 	blob := commonpb.DataBlob{EncodingType: enumspb.ENCODING_TYPE_PROTO3}
 	data, err := proto.Marshal(m)
 	if err != nil {
@@ -190,7 +198,11 @@ func Proto3Decode(blob []byte, e enumspb.EncodingType, result proto.Message) err
 	if e != enumspb.ENCODING_TYPE_PROTO3 {
 		return NewUnknownEncodingTypeError(e.String(), enumspb.ENCODING_TYPE_PROTO3)
 	}
-	if err := proto.Unmarshal(blob, result); err != nil {
+	err := proto.Unmarshal(blob, result)
+	if err == nil {
+		err = utf8validator.Validate(result, utf8validator.SourcePersistence)
+	}
+	if err != nil {
 		return NewDeserializationError(enumspb.ENCODING_TYPE_PROTO3, err)
 	}
 	return nil

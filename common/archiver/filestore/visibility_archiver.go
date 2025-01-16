@@ -37,7 +37,6 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/api/serviceerror"
 	workflowpb "go.temporal.io/api/workflow/v1"
-
 	archiverspb "go.temporal.io/server/api/archiver/v1"
 	"go.temporal.io/server/common/archiver"
 	"go.temporal.io/server/common/config"
@@ -356,12 +355,13 @@ func convertToExecutionInfo(record *archiverspb.VisibilityRecord, saTypeMap sear
 		Type: &commonpb.WorkflowType{
 			Name: record.WorkflowTypeName,
 		},
-		StartTime:        record.StartTime,
-		ExecutionTime:    record.ExecutionTime,
-		CloseTime:        record.CloseTime,
-		Status:           record.Status,
-		HistoryLength:    record.HistoryLength,
-		Memo:             record.Memo,
-		SearchAttributes: searchAttributes,
+		StartTime:         record.StartTime,
+		ExecutionTime:     record.ExecutionTime,
+		CloseTime:         record.CloseTime,
+		ExecutionDuration: record.ExecutionDuration,
+		Status:            record.Status,
+		HistoryLength:     record.HistoryLength,
+		Memo:              record.Memo,
+		SearchAttributes:  searchAttributes,
 	}, nil
 }

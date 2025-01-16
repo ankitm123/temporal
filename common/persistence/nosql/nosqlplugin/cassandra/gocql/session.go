@@ -28,11 +28,9 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/gocql/gocql"
-
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
@@ -69,7 +67,7 @@ func NewSession(
 	metricsHandler metrics.Handler,
 ) (*session, error) {
 
-	gocqlSession, err := initSession(newClusterConfigFunc, metricsHandler)
+	gocqlSession, err := initSession(logger, newClusterConfigFunc, metricsHandler)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +100,7 @@ func (s *session) refresh() {
 		return
 	}
 
-	newSession, err := initSession(s.newClusterConfigFunc, s.metricsHandler)
+	newSession, err := initSession(s.logger, s.newClusterConfigFunc, s.metricsHandler)
 	if err != nil {
 		s.logger.Error("gocql wrapper: unable to refresh gocql session", tag.Error(err))
 		handler := s.metricsHandler.WithTags(metrics.FailureTag(refreshErrorTagValue))
@@ -118,9 +116,11 @@ func (s *session) refresh() {
 }
 
 func initSession(
+	logger log.Logger,
 	newClusterConfigFunc func() (*gocql.ClusterConfig, error),
 	metricsHandler metrics.Handler,
-) (*gocql.Session, error) {
+) (gs *gocql.Session, retErr error) {
+	defer log.CapturePanic(logger, &retErr)
 	cluster, err := newClusterConfigFunc()
 	if err != nil {
 		return nil, err
@@ -149,32 +149,32 @@ func (s *session) Query(
 
 func (s *session) NewBatch(
 	batchType BatchType,
-) Batch {
+) *Batch {
 	b := s.Value.Load().(*gocql.Session).NewBatch(mustConvertBatchType(batchType))
 	if b == nil {
 		return nil
 	}
-	return &batch{
+	return &Batch{
 		session:    s,
 		gocqlBatch: b,
 	}
 }
 
 func (s *session) ExecuteBatch(
-	b Batch,
+	b *Batch,
 ) (retError error) {
 	defer func() { s.handleError(retError) }()
 
-	return s.Value.Load().(*gocql.Session).ExecuteBatch(b.(*batch).gocqlBatch)
+	return s.Value.Load().(*gocql.Session).ExecuteBatch(b.gocqlBatch)
 }
 
 func (s *session) MapExecuteBatchCAS(
-	b Batch,
+	b *Batch,
 	previous map[string]interface{},
 ) (_ bool, _ Iter, retError error) {
 	defer func() { s.handleError(retError) }()
 
-	applied, iter, err := s.Value.Load().(*gocql.Session).MapExecuteBatchCAS(b.(*batch).gocqlBatch, previous)
+	applied, iter, err := s.Value.Load().(*gocql.Session).MapExecuteBatchCAS(b.gocqlBatch, previous)
 	return applied, iter, err
 }
 
@@ -202,9 +202,7 @@ func (s *session) handleError(
 ) {
 	switch err {
 	case gocql.ErrNoConnections,
-		gocql.ErrSessionClosed,
-		gocql.ErrConnectionClosed,
-		syscall.ECONNRESET:
+		gocql.ErrSessionClosed:
 		s.refresh()
 	default:
 		// noop

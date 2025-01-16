@@ -34,16 +34,14 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	enumspb "go.temporal.io/api/enums/v1"
-	"google.golang.org/protobuf/types/known/timestamppb"
-
 	clockspb "go.temporal.io/server/api/clock/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common/debug"
-
 	"go.temporal.io/server/common/log"
 	p "go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/common/testing/protorequire"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type (
@@ -207,45 +205,6 @@ func (s *TaskQueueTaskSuite) TestCreateGet_Multiple() {
 		actualTasks = append(actualTasks, resp.Tasks...)
 	}
 	protorequire.ProtoSliceEqual(s.T(), expectedTasks, actualTasks)
-}
-
-func (s *TaskQueueTaskSuite) TestCreateDelete_One() {
-	rangeID := rand.Int63()
-	taskQueue := s.createTaskQueue(rangeID)
-
-	taskID := rand.Int63()
-	task := s.randomTask(taskID)
-	_, err := s.taskManager.CreateTasks(s.ctx, &p.CreateTasksRequest{
-		TaskQueueInfo: &p.PersistedTaskQueueInfo{
-			RangeID: rangeID,
-			Data:    taskQueue,
-		},
-		Tasks: []*persistencespb.AllocatedTaskInfo{task},
-	})
-	s.NoError(err)
-
-	err = s.taskManager.CompleteTask(s.ctx, &p.CompleteTaskRequest{
-		TaskQueue: &p.TaskQueueKey{
-			NamespaceID:   s.namespaceID,
-			TaskQueueName: s.taskQueueName,
-			TaskQueueType: s.taskQueueType,
-		},
-		TaskID: taskID,
-	})
-	s.NoError(err)
-
-	resp, err := s.taskManager.GetTasks(s.ctx, &p.GetTasksRequest{
-		NamespaceID:        s.namespaceID,
-		TaskQueue:          s.taskQueueName,
-		TaskType:           s.taskQueueType,
-		InclusiveMinTaskID: taskID,
-		ExclusiveMaxTaskID: taskID + 1,
-		PageSize:           100,
-		NextPageToken:      nil,
-	})
-	s.NoError(err)
-	protorequire.ProtoSliceEqual(s.T(), []*persistencespb.AllocatedTaskInfo{}, resp.Tasks)
-	s.Nil(resp.NextPageToken)
 }
 
 func (s *TaskQueueTaskSuite) TestCreateDelete_Multiple() {

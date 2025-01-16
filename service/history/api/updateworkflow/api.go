@@ -26,18 +26,14 @@ package updateworkflow
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	updatepb "go.temporal.io/api/update/v1"
 	"go.temporal.io/api/workflowservice/v1"
-	"google.golang.org/protobuf/types/known/durationpb"
-
-	enumspb "go.temporal.io/api/enums/v1"
-
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	"go.temporal.io/server/api/historyservice/v1"
 	"go.temporal.io/server/api/matchingservice/v1"
@@ -54,6 +50,7 @@ import (
 	"go.temporal.io/server/service/history/shard"
 	"go.temporal.io/server/service/history/workflow"
 	"go.temporal.io/server/service/history/workflow/update"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 const (
@@ -108,32 +105,44 @@ func (u *Updater) Invoke(
 	err := api.GetAndUpdateWorkflowWithNew(
 		ctx,
 		nil,
-		api.BypassMutableStateConsistencyPredicate,
 		wfKey,
-		func(lease api.WorkflowLease) (*api.UpdateWorkflowAction, error) { return u.Apply(ctx, lease) },
+		func(lease api.WorkflowLease) (*api.UpdateWorkflowAction, error) {
+			ms := lease.GetMutableState()
+			updateReg := lease.GetContext().UpdateRegistry(ctx)
+			return u.ApplyRequest(ctx, updateReg, ms)
+		},
 		nil,
 		u.shardCtx,
 		u.workflowConsistencyChecker,
 	)
 
 	if err != nil {
-		return u.OnError(err)
+		return nil, err
 	}
+
 	return u.OnSuccess(ctx)
 }
 
-func (u *Updater) Apply(
+func (u *Updater) ApplyRequest(
 	ctx context.Context,
-	workflowLease api.WorkflowLease,
+	updateReg update.Registry,
+	ms workflow.MutableState,
 ) (*api.UpdateWorkflowAction, error) {
-	ms := workflowLease.GetMutableState()
-	if !ms.IsWorkflowExecutionRunning() {
-		return nil, consts.ErrWorkflowCompleted
-	}
-	u.wfKey = ms.GetWorkflowKey()
-
-	if u.req.GetRequest().GetFirstExecutionRunId() != "" && ms.GetExecutionInfo().GetFirstExecutionRunId() != u.req.GetRequest().GetFirstExecutionRunId() {
+	if u.req.GetRequest().GetFirstExecutionRunId() != "" &&
+		ms.GetExecutionInfo().GetFirstExecutionRunId() != u.req.GetRequest().GetFirstExecutionRunId() {
 		return nil, consts.ErrWorkflowExecutionNotFound
+	}
+
+	u.wfKey = ms.GetWorkflowKey()
+	updateID := u.req.GetRequest().GetRequest().GetMeta().GetUpdateId()
+
+	if !ms.IsWorkflowExecutionRunning() {
+		// If the WF is not running anymore, use an existing Update, if it exists for the requested ID.
+		// This ensures that repeated Update requests with the same ID see the same result.
+		if u.upd = updateReg.Find(ctx, updateID); u.upd != nil {
+			return &api.UpdateWorkflowAction{Noop: true}, nil
+		}
+		return nil, consts.ErrWorkflowCompleted
 	}
 
 	if ms.GetExecutionInfo().WorkflowTaskAttempt >= failUpdateWorkflowTaskAttemptCount {
@@ -149,8 +158,18 @@ func (u *Updater) Apply(
 		return nil, serviceerror.NewWorkflowNotReady("Unable to perform workflow execution update due to Workflow Task in failed state.")
 	}
 
-	updateID := u.req.GetRequest().GetRequest().GetMeta().GetUpdateId()
-	updateReg := workflowLease.GetContext().UpdateRegistry(ctx)
+	// If workflow attempted to close itself on previous WFT completion,
+	// and has another WFT running, which most likely will try to complete workflow again,
+	// then don't admit new updates.
+	if ms.IsWorkflowCloseAttempted() && ms.HasStartedWorkflowTask() {
+		u.shardCtx.GetLogger().Info("Fail update because workflow is closing.",
+			tag.WorkflowNamespace(u.req.Request.Namespace),
+			tag.WorkflowNamespaceID(u.wfKey.NamespaceID),
+			tag.WorkflowID(u.wfKey.WorkflowID),
+			tag.WorkflowRunID(u.wfKey.RunID))
+		return nil, consts.ErrWorkflowClosing
+	}
+
 	var (
 		alreadyExisted bool
 		err            error
@@ -158,7 +177,7 @@ func (u *Updater) Apply(
 	if u.upd, alreadyExisted, err = updateReg.FindOrCreate(ctx, updateID); err != nil {
 		return nil, err
 	}
-	if err = u.upd.Request(ctx, u.req.GetRequest().GetRequest(), workflow.WithEffects(effect.Immediate(ctx), ms)); err != nil {
+	if err = u.upd.Admit(u.req.GetRequest().GetRequest(), workflow.WithEffects(effect.Immediate(ctx), ms)); err != nil {
 		return nil, err
 	}
 
@@ -172,30 +191,15 @@ func (u *Updater) Apply(
 		}, nil
 	}
 
-	// Speculative WT can be created only if there are no events which worker has not yet seen,
-	// i.e. last event in the history is WTCompleted event.
-	// It is guaranteed that WTStarted event is followed by WTCompleted event and history tail might look like:
-	//   WTStarted
-	//   WTCompleted
-	//   --> NextEventID points here
-	// In this case difference between NextEventID and LastWorkflowTaskStartedEventID is 2.
-	// If there are other events after WTCompleted event, then difference is > 2 and speculative WT can't be created.
-	canCreateSpeculativeWT := ms.GetNextEventID() == ms.GetLastWorkflowTaskStartedEventID()+2
-	if !canCreateSpeculativeWT {
-		return &api.UpdateWorkflowAction{
-			Noop:               false,
-			CreateWorkflowTask: true,
-		}, nil
-	}
-
 	// This will try not to add an event but will create speculative WT in mutable state.
 	newWorkflowTask, err := ms.AddWorkflowTaskScheduledEvent(false, enumsspb.WORKFLOW_TASK_TYPE_SPECULATIVE)
 	if err != nil {
 		return nil, err
 	}
 	if newWorkflowTask.Type != enumsspb.WORKFLOW_TASK_TYPE_SPECULATIVE {
-		// This should never happen because WT is created as normal (despite speculative is requested)
-		// only if there were buffered events and because there were no pending WT, there can't be buffered events.
+		// This means that a normal WFT was created despite a speculative WFT having been requested. It implies that
+		// there were buffered events. But because there was no pending WFT, there can't be buffered events. Therefore
+		// this should never happen.
 		return nil, consts.ErrWorkflowTaskStateInconsistent
 	}
 
@@ -207,8 +211,12 @@ func (u *Updater) Apply(
 	u.taskQueue = common.CloneProto(newWorkflowTask.TaskQueue)
 	u.normalTaskQueueName = ms.GetExecutionInfo().TaskQueue
 	u.directive = worker_versioning.MakeDirectiveForWorkflowTask(
-		ms.GetWorkerVersionStamp(),
-		ms.GetLastWorkflowTaskStartedEventID(),
+		ms.GetInheritedBuildId(),
+		ms.GetAssignedBuildId(),
+		ms.GetMostRecentWorkerVersionStamp(),
+		ms.HasCompletedAnyWorkflowTask(),
+		ms.GetEffectiveVersioningBehavior(),
+		ms.GetEffectiveDeployment(),
 	)
 
 	return &api.UpdateWorkflowAction{
@@ -217,30 +225,15 @@ func (u *Updater) Apply(
 	}, nil
 }
 
-func (u *Updater) OnError(
-	err error,
-) (*historyservice.UpdateWorkflowExecutionResponse, error) {
-	// Special handling for consts.ErrWorkflowCompleted here is needed for consistency with the case when update is received while WFT is running and this WFT completes workflow. In this case update is rejected (see update.CancelIncomplete).
-	if errors.Is(err, consts.ErrWorkflowCompleted) {
-		rejectionResp := u.createResponse(
-			u.wfKey,
-			&updatepb.Outcome{
-				Value: &updatepb.Outcome_Failure{Failure: update.CancelReasonWorkflowCompleted.RejectionFailure()},
-			},
-			enumspb.UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED)
-		return rejectionResp, err
-	}
-	return nil, err
-}
-
 func (u *Updater) OnSuccess(
 	ctx context.Context,
 ) (*historyservice.UpdateWorkflowExecutionResponse, error) {
-	// Speculative WT was created and needs to be added directly to matching w/o transfer task.
-	// TODO (alex): This code is copied from transferQueueActiveTaskExecutor.processWorkflowTask.
-	//   Helper function needs to be extracted to avoid code duplication.
-	if u.scheduledEventID != common.EmptyEventID {
-		err := u.addWorkflowTaskToMatching(ctx, u.wfKey, u.taskQueue, u.scheduledEventID, u.scheduleToStartTimeout, u.directive)
+	usesSpeculativeWFT := u.scheduledEventID != common.EmptyEventID
+	if usesSpeculativeWFT {
+		// Speculative WFT was created and needs to be added directly to matching w/o transfer task.
+		// TODO (alex): This code is copied from transferQueueActiveTaskExecutor.processWorkflowTask.
+		//   Helper function needs to be extracted to avoid code duplication.
+		err := u.addWorkflowTaskToMatching(ctx)
 
 		if _, isStickyWorkerUnavailable := err.(*serviceerrors.StickyWorkerUnavailable); isStickyWorkerUnavailable {
 			// If sticky worker is unavailable, switch to original normal task queue.
@@ -248,7 +241,7 @@ func (u *Updater) OnSuccess(
 				Name: u.normalTaskQueueName,
 				Kind: enumspb.TASK_QUEUE_KIND_NORMAL,
 			}
-			err = u.addWorkflowTaskToMatching(ctx, u.wfKey, u.taskQueue, u.scheduledEventID, u.scheduleToStartTimeout, u.directive)
+			err = u.addWorkflowTaskToMatching(ctx)
 		}
 
 		if err != nil {
@@ -286,14 +279,7 @@ func (u *Updater) OnSuccess(
 }
 
 // TODO (alex-update): Consider moving this func to a better place.
-func (u *Updater) addWorkflowTaskToMatching(
-	ctx context.Context,
-	wfKey definition.WorkflowKey,
-	tq *taskqueuepb.TaskQueue,
-	scheduledEventID int64,
-	wtScheduleToStartTimeout time.Duration,
-	directive *taskqueuespb.TaskVersionDirective,
-) error {
+func (u *Updater) addWorkflowTaskToMatching(ctx context.Context) error {
 	clock, err := u.shardCtx.NewVectorClock()
 	if err != nil {
 		return err
@@ -302,14 +288,14 @@ func (u *Updater) addWorkflowTaskToMatching(
 	_, err = u.matchingClient.AddWorkflowTask(ctx, &matchingservice.AddWorkflowTaskRequest{
 		NamespaceId: u.namespaceID.String(),
 		Execution: &commonpb.WorkflowExecution{
-			WorkflowId: wfKey.WorkflowID,
-			RunId:      wfKey.RunID,
+			WorkflowId: u.wfKey.WorkflowID,
+			RunId:      u.wfKey.RunID,
 		},
-		TaskQueue:              tq,
-		ScheduledEventId:       scheduledEventID,
-		ScheduleToStartTimeout: durationpb.New(wtScheduleToStartTimeout),
+		TaskQueue:              u.taskQueue,
+		ScheduledEventId:       u.scheduledEventID,
+		ScheduleToStartTimeout: durationpb.New(u.scheduleToStartTimeout),
 		Clock:                  clock,
-		VersionDirective:       directive,
+		VersionDirective:       u.directive,
 	})
 	if err != nil {
 		return err
