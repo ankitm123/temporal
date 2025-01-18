@@ -10,20 +10,18 @@
         enabled: true
         initialFailoverVersion: 1
         rpcName: "frontend"
-        rpcAddress: "127.0.0.1:7134"
+        rpcAddress: "nowhere1:7134"
       cluster-b:
         enabled: true
         initialFailoverVersion: 2
         rpcName: "frontend"
-        rpcAddress: "127.0.0.1:8134"
+        rpcAddress: "nowhere2:7134"
       cluster-c:
         enabled: true
         initialFailoverVersion: 3
         rpcName: "frontend"
-        rpcAddress: "127.0.0.1:9134"
-  enablearchival: false
+        rpcAddress: "nowhere3:7134"
   workerconfig:
-    enablearchiver: false
     enablereplicator: true
   clusterno: 0
   historyconfig:
@@ -49,20 +47,18 @@
         enabled: true
         initialFailoverVersion: 1
         rpcName: "frontend"
-        rpcAddress: "127.0.0.1:7134"
+        rpcAddress: "nowhere1:7134"
       cluster-b:
         enabled: true
         initialFailoverVersion: 2
         rpcName: "frontend"
-        rpcAddress: "127.0.0.1:8134"
+        rpcAddress: "nowhere2:7134"
       cluster-c:
         enabled: true
         initialFailoverVersion: 3
         rpcName: "frontend"
-        rpcAddress: "127.0.0.1:9134"
-  enablearchival: false
+        rpcAddress: "nowhere3:7134"
   workerconfig:
-    enablearchiver: false
     enablereplicator: true
   clusterno: 1
   historyconfig:
@@ -88,20 +84,18 @@
         enabled: true
         initialFailoverVersion: 1
         rpcName: "frontend"
-        rpcAddress: "127.0.0.1:7134"
+        rpcAddress: "nowhere1:7134"
       cluster-b:
         enabled: true
         initialFailoverVersion: 2
         rpcName: "frontend"
-        rpcAddress: "127.0.0.1:8134"
+        rpcAddress: "nowhere2:7134"
       cluster-c:
         enabled: true
         initialFailoverVersion: 3
         rpcName: "frontend"
-        rpcAddress: "127.0.0.1:9134"
-  enablearchival: false
+        rpcAddress: "nowhere3:7134"
   workerconfig:
-    enablearchiver: false
     enablereplicator: true
   clusterno: 2
   historyconfig:

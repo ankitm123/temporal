@@ -1,37 +1,35 @@
 ############################# Main targets #############################
 # Install all tools and builds binaries.
-install: update-tools bins
+install: bins
 
 # Rebuild binaries (used by Dockerfile).
 bins: temporal-server temporal-cassandra-tool temporal-sql-tool tdbg
 
 # Install all tools, recompile proto files, run all possible checks and tests (long but comprehensive).
-all: update-tools clean proto bins check test
+all: clean proto bins check test
 
 # Used in CI
-ci-build-misc: print-go-version ci-update-tools proto bins shell-check copyright-check go-generate gomodtidy ensure-no-changes
+ci-build-misc: print-go-version proto go-generate buf-breaking shell-check copyright-check goimports gomodtidy ensure-no-changes
 
 # Delete all build artifacts
 clean: clean-bins clean-test-results
+	rm -rf $(STAMPDIR)
+	rm -rf $(TEST_OUTPUT_ROOT)
+	rm -rf $(LOCALBIN)
 
 # Recompile proto files.
-proto: clean-proto buf-lint api-linter protoc service-clients goimports-proto proto-mocks copyright-proto
-
-# Update proto submodule from remote and recompile proto files.
-update-proto: update-proto-submodule proto gomodtidy
+proto: lint-protos lint-api protoc proto-codegen
 ########################################################################
 
-.PHONY: proto proto-mocks protoc
+.PHONY: proto protoc install bins ci-build-misc clean
 
 ##### Arguments ######
-
 GOOS        ?= $(shell go env GOOS)
 GOARCH      ?= $(shell go env GOARCH)
 GOPATH      ?= $(shell go env GOPATH)
 # Disable cgo by default.
 CGO_ENABLED ?= 0
 
-TEST_ARGS ?= -race
 PERSISTENCE_TYPE ?= nosql
 PERSISTENCE_DRIVER ?= cassandra
 
@@ -43,15 +41,46 @@ VISIBILITY_DB ?= temporal_visibility
 # Always use "protolegacy" tag to allow disabling utf-8 validation on proto messages
 # during proto library transition.
 ALL_BUILD_TAGS := protolegacy,$(BUILD_TAG)
-ALL_TEST_TAGS := $(ALL_BUILD_TAGS),$(TEST_TAG)
+ALL_TEST_TAGS := $(ALL_BUILD_TAGS),test_dep,$(TEST_TAG)
 BUILD_TAG_FLAG := -tags $(ALL_BUILD_TAGS)
 TEST_TAG_FLAG := -tags $(ALL_TEST_TAGS)
 
+# 20 minutes is the upper bound defined for all tests. (Tests in CI take up to about 12:30 now)
+# If you change this, also change .github/workflows/run-tests.yml!
+# The timeout in the GH workflow must be larger than this to avoid GH timing out the action,
+# which causes the a job run to not produce any logs and hurts the debugging experience.
+TEST_TIMEOUT ?= 25m
+
+# Number of retries for *-coverage targets.
+FAILED_TEST_RETRIES ?= 2
+
+# Whether or not to test with the race detector. All of (1 on y yes t true) are true values.
+TEST_RACE_FLAG ?= on
+# Whether or not to shuffle tests. All of (1 on y yes t true) are true values.
+TEST_SHUFFLE_FLAG ?= on
+# Common test args used in the various test suite targets.
+COMPILED_TEST_ARGS := -timeout=$(TEST_TIMEOUT) \
+		     $(if $(filter 1 on y yes t true, $(TEST_RACE_FLAG)),-race,) \
+		     $(if $(filter 1 on y yes t true, $(TEST_SHUFFLE_FLAG)),-shuffle on,) \
+		     $(TEST_PARALLEL_FLAGS) \
+		     $(TEST_ARGS) \
+		     $(TEST_TAG_FLAG)
 
 ##### Variables ######
 
-GOBIN := $(if $(shell go env GOBIN),$(shell go env GOBIN),$(GOPATH)/bin)
-PATH := $(GOBIN):$(PATH)
+ROOT := $(shell git rev-parse --show-toplevel)
+LOCALBIN := .bin
+STAMPDIR := .stamp
+export PATH := $(ROOT)/$(LOCALBIN):$(PATH)
+GOINSTALL := GOBIN=$(ROOT)/$(LOCALBIN) go install
+
+OTEL ?= false
+ifeq ($(OTEL),true)
+	export OTEL_BSP_SCHEDULE_DELAY=0
+	export OTEL_EXPORTER_OTLP_TRACES_INSECURE=true
+	export OTEL_TRACES_EXPORTER=otlp
+	export TEMPORAL_OTEL_DEBUG=true
+endif
 
 MODULE_ROOT := $(lastword $(shell grep -e "^module " go.mod))
 COLOR := "\e[1;36m%s\e[0m\n"
@@ -62,17 +91,14 @@ define NEWLINE
 
 endef
 
-TEST_TIMEOUT := 30m
-
-
 PROTO_ROOT := proto
 PROTO_FILES = $(shell find ./$(PROTO_ROOT)/internal -name "*.proto")
 PROTO_DIRS = $(sort $(dir $(PROTO_FILES)))
-PROTO_IMPORTS = -I=$(PROTO_ROOT)/internal -I=$(PROTO_ROOT)/api -I=$(PROTO_ROOT)/dependencies
-PROTO_OPTS = paths=source_relative:$(PROTO_OUT)
+API_BINPB := $(PROTO_ROOT)/api.binpb
+# Note: If you change the value of INTERNAL_BINPB, you'll have to add logic to
+# develop/buf-breaking.sh to handle the old and new values at once.
+INTERNAL_BINPB := $(PROTO_ROOT)/image.bin
 PROTO_OUT := api
-PROTO_ENUMS := $(shell grep -R '^enum ' $(PROTO_ROOT) | cut -d ' ' -f2)
-PROTO_PATHS = paths=source_relative:$(PROTO_OUT)
 
 ALL_SRC         := $(shell find . -name "*.go")
 ALL_SRC         += go.mod
@@ -80,6 +106,7 @@ ALL_SCRIPTS     := $(shell find . -name "*.sh")
 
 MAIN_BRANCH    := main
 
+# If you update these dirs, please also update in CategoryDirs find_altered_tests.go
 TEST_DIRS       := $(sort $(dir $(filter %_test.go,$(ALL_SRC))))
 FUNCTIONAL_TEST_ROOT          := ./tests
 FUNCTIONAL_TEST_XDC_ROOT      := ./tests/xdc
@@ -87,7 +114,9 @@ FUNCTIONAL_TEST_NDC_ROOT      := ./tests/ndc
 DB_INTEGRATION_TEST_ROOT      := ./common/persistence/tests
 DB_TOOL_INTEGRATION_TEST_ROOT := ./tools/tests
 INTEGRATION_TEST_DIRS := $(DB_INTEGRATION_TEST_ROOT) $(DB_TOOL_INTEGRATION_TEST_ROOT) ./temporaltest ./internal/temporalite
+ifeq ($(UNIT_TEST_DIRS),)
 UNIT_TEST_DIRS := $(filter-out $(FUNCTIONAL_TEST_ROOT)% $(FUNCTIONAL_TEST_XDC_ROOT)% $(FUNCTIONAL_TEST_NDC_ROOT)% $(DB_INTEGRATION_TEST_ROOT)% $(DB_TOOL_INTEGRATION_TEST_ROOT)% ./temporaltest% ./internal/temporalite%,$(TEST_DIRS))
+endif
 
 # github.com/urfave/cli/v2@v2.4.0             - needs to accept comma in values before unlocking https://github.com/urfave/cli/pull/1241.
 PINNED_DEPENDENCIES := \
@@ -126,108 +155,153 @@ endef
 print-go-version:
 	@go version
 
-update-goimports:
-	@printf $(COLOR) "Install/update goimports..."
-	@go install golang.org/x/tools/cmd/goimports@latest
+$(STAMPDIR):
+	@mkdir -p $(STAMPDIR)
 
-update-linters:
-	@printf $(COLOR) "Install/update linters..."
-	@go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.53.3
+$(LOCALBIN):
+	@mkdir -p $(LOCALBIN)
 
-update-mockgen:
-	@printf $(COLOR) "Install/update mockgen tool..."
-	@go install github.com/golang/mock/mockgen@v1.7.0-rc.1
+# When updating the version, update the golangci-lint GHA workflow as well.
+.PHONY: golangci-lint
+GOLANGCI_LINT_BASE_REV ?= $(MAIN_BRANCH)
+GOLANGCI_LINT_FIX ?= true
+# TODO: change to release once newer version than 1.62.2 exists: https://github.com/golangci/golangci-lint/releases
+GOLANGCI_LINT_VERSION := dafd65537336fdce063c492a7ab2a68cc89f8d52
+GOLANGCI_LINT := $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
+$(GOLANGCI_LINT): $(LOCALBIN)
+	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+	
+# Don't get confused, there is a single linter called gci, which is a part of the mega linter we use is called golangci-lint.
+GCI_VERSION := v0.13.5
+GCI := $(LOCALBIN)/gci-$(GCI_VERSION)
+$(GCI): $(LOCALBIN)
+	$(call go-install-tool,$(GCI),github.com/daixiang0/gci,$(GCI_VERSION))
 
-update-gotestsum:
-	@printf $(COLOR) "Install/update gotestsum..."
-	@go install gotest.tools/gotestsum@v1.11
+GOTESTSUM_VER := v1.11
+GOTESTSUM := $(LOCALBIN)/gotestsum-$(GOTESTSUM_VER)
+$(GOTESTSUM): | $(LOCALBIN)
+	$(call go-install-tool,$(GOTESTSUM),gotest.tools/gotestsum,$(GOTESTSUM_VER))
 
-update-proto-plugins:
-	@printf $(COLOR) "Install/update proto plugins..."
-	@go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-	@go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-	@go install -modfile build/go.mod go.temporal.io/api/cmd/protoc-gen-go-helpers
-	@go install -modfile build/go.mod go.temporal.io/api/cmd/protogen
+API_LINTER_VER := v1.32.3
+API_LINTER := $(LOCALBIN)/api-linter-$(API_LINTER_VER)
+$(API_LINTER): | $(LOCALBIN)
+	$(call go-install-tool,$(API_LINTER),github.com/googleapis/api-linter/cmd/api-linter,$(API_LINTER_VER))
 
-update-proto-linters:
-	@printf $(COLOR) "Install/update proto linters..."
-	@go install github.com/googleapis/api-linter/cmd/api-linter@v1.32.3
-	@go install github.com/bufbuild/buf/cmd/buf@v1.6.0
+BUF_VER := v1.6.0
+BUF := $(LOCALBIN)/buf-$(BUF_VER)
+$(BUF): | $(LOCALBIN)
+	$(call go-install-tool,$(BUF),github.com/bufbuild/buf/cmd/buf,$(BUF_VER))
 
-update-tctl:
-	@printf $(COLOR) "Install/update tctl..."
-	@go install github.com/temporalio/tctl/cmd/tctl@latest
+GO_API_VER := v1.33.0
+PROTOGEN := $(LOCALBIN)/protogen-$(GO_API_VER)
+$(PROTOGEN): | $(LOCALBIN)
+	$(call go-install-tool,$(PROTOGEN),go.temporal.io/api/cmd/protogen,$(GO_API_VER))
 
-update-cli:
-	@printf $(COLOR) "Install/update cli..."
-	curl -sSf https://temporal.download/cli.sh | sh
+ACTIONLINT_VER := v1.6.27
+ACTIONLINT := $(LOCALBIN)/actionlint-$(ACTIONLINT_VER)
+$(ACTIONLINT): | $(LOCALBIN)
+	$(call go-install-tool,$(ACTIONLINT),github.com/rhysd/actionlint/cmd/actionlint,$(ACTIONLINT_VER))
 
-update-ui:
-	@printf $(COLOR) "Install/update temporal ui-server..."
-	@go install github.com/temporalio/ui-server/cmd/server@latest
+# The following tools need to have a consistent name, so we use a versioned stamp file to ensure the version we want is installed
+# while installing to an unversioned binary name.
+GOIMPORTS_VER := v0.20.0
+GOIMPORTS := $(LOCALBIN)/goimports
+$(STAMPDIR)/goimports-$(GOIMPORTS_VER): | $(STAMPDIR) $(LOCALBIN)
+	$(call go-install-tool,$(GOIMPORTS),golang.org/x/tools/cmd/goimports,$(GOIMPORTS_VER))
+	@touch $@
+$(GOIMPORTS): $(STAMPDIR)/goimports-$(GOIMPORTS_VER)
 
-update-tools: update-goimports update-linters update-mockgen update-proto-plugins update-proto-linters update-gotestsum
+GOWRAP_VER := v1.4.1
+GOWRAP := $(LOCALBIN)/gowrap
+$(STAMPDIR)/gowrap-$(GOWRAP_VER): | $(STAMPDIR) $(LOCALBIN)
+	$(call go-install-tool,$(GOWRAP),github.com/hexdigest/gowrap/cmd/gowrap,$(GOWRAP_VER))
+	@touch $@
+$(GOWRAP): $(STAMPDIR)/gowrap-$(GOWRAP_VER)
 
-# update-linters is not included because in CI linters are run by github actions.
-ci-update-tools: update-goimports update-mockgen update-proto-plugins update-proto-linters update-gotestsum
+# Mockgen is called by name throughout the codebase, so we need to keep the binary name consistent
+MOCKGEN_VER := v0.4.0
+MOCKGEN := $(LOCALBIN)/mockgen
+$(STAMPDIR)/mockgen-$(MOCKGEN_VER): | $(STAMPDIR) $(LOCALBIN)
+	$(call go-install-tool,$(MOCKGEN),go.uber.org/mock/mockgen,$(MOCKGEN_VER))
+	@touch $@
+$(MOCKGEN): $(STAMPDIR)/mockgen-$(MOCKGEN_VER)
+
+STRINGER_VER := v0.21.0
+STRINGER := $(LOCALBIN)/stringer
+$(STAMPDIR)/stringer-$(STRINGER_VER): | $(STAMPDIR) $(LOCALBIN)
+	$(call go-install-tool,$(STRINGER),golang.org/x/tools/cmd/stringer,$(STRINGER_VER))
+	@touch $@
+$(STRINGER): $(STAMPDIR)/stringer-$(STRINGER_VER)
+
+PROTOC_GEN_GO_VER := v1.33.0
+PROTOC_GEN_GO := $(LOCALBIN)/protoc-gen-go
+$(STAMPDIR)/protoc-gen-go-$(PROTOC_GEN_GO_VER): | $(STAMPDIR) $(LOCALBIN)
+	$(call go-install-tool,$(PROTOC_GEN_GO),google.golang.org/protobuf/cmd/protoc-gen-go,$(PROTOC_GEN_GO_VER))
+	@touch $@
+$(PROTOC_GEN_GO): $(STAMPDIR)/protoc-gen-go-$(PROTOC_GEN_GO_VER)
+
+PROTOC_GEN_GO_GRPC_VER := v1.3.0
+PROTOC_GEN_GO_GRPC := $(LOCALBIN)/protoc-gen-go-grpc
+$(STAMPDIR)/protoc-gen-go-grpc-$(PROTOC_GEN_GO_GRPC_VER): | $(STAMPDIR) $(LOCALBIN)
+	$(call go-install-tool,$(PROTOC_GEN_GO_GRPC),google.golang.org/grpc/cmd/protoc-gen-go-grpc,$(PROTOC_GEN_GO_GRPC_VER))
+	@touch $@
+$(PROTOC_GEN_GO_GRPC): $(STAMPDIR)/protoc-gen-go-grpc-$(PROTOC_GEN_GO_GRPC_VER)
+
+PROTOC_GEN_GO_HELPERS := $(LOCALBIN)/protoc-gen-go-helpers
+$(STAMPDIR)/protoc-gen-go-helpers-$(GO_API_VER): | $(STAMPDIR) $(LOCALBIN)
+	$(call go-install-tool,$(PROTOC_GEN_GO_HELPERS),go.temporal.io/api/cmd/protoc-gen-go-helpers,$(GO_API_VER))
+	@touch $@
+$(PROTOC_GEN_GO_HELPERS): $(STAMPDIR)/protoc-gen-go-helpers-$(GO_API_VER)
+
+# go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
+# $1 - target path with name of binary (ideally with version)
+# $2 - package url which can be installed
+# $3 - specific version of package
+# This is courtesy of https://github.com/kubernetes-sigs/kubebuilder/pull/3718
+define go-install-tool
+@[ -f $(1) ] || { \
+set -e; \
+package=$(2)@$(3) ;\
+printf $(COLOR) "Downloading $${package}" ;\
+tmpdir=$$(mktemp -d) ;\
+GOBIN=$${tmpdir} go install $${package} ;\
+mv $${tmpdir}/$$(basename "$$(echo "$(1)" | sed "s/-$(3)$$//")") $(1) ;\
+rm -rf $${tmpdir} ;\
+}
+endef
 
 ##### Proto #####
-$(PROTO_OUT):
-	@mkdir -p $(PROTO_OUT)
+$(API_BINPB): go.mod go.sum $(PROTO_FILES)
+	@printf $(COLOR) "Generating proto dependencies image..."
+	@./cmd/tools/getproto/run.sh --out $@
 
-clean-proto:
-	@rm -rf $(PROTO_OUT)/*
+$(INTERNAL_BINPB): $(API_BINPB) $(PROTO_FILES)
+	@printf $(COLOR) "Generate proto image..."
+	@protoc --descriptor_set_in=$(API_BINPB) -I=$(PROTO_ROOT)/internal $(PROTO_FILES) -o $@
 
-update-proto-submodule:
-	@printf $(COLOR) "Update proto submodule from remote..."
-	git submodule update --force --remote $(PROTO_ROOT)/api
+protoc: $(PROTOGEN) $(MOCKGEN) $(GOIMPORTS) $(PROTOC_GEN_GO) $(PROTOC_GEN_GO_GRPC) $(PROTOC_GEN_GO_HELPERS) $(API_BINPB)
+	@env \
+		PROTOGEN=$(PROTOGEN) MOCKGEN=$(MOCKGEN) GOIMPORTS=$(GOIMPORTS) \
+		API_BINPB=$(API_BINPB) PROTO_ROOT=$(PROTO_ROOT) PROTO_OUT=$(PROTO_OUT) \
+		./develop/protoc.sh
 
-install-proto-submodule:
-	@printf $(COLOR) "Install proto submodule..."
-	git submodule update --init $(PROTO_ROOT)/api
-
-protoc: clean-proto $(PROTO_OUT)
-	@protogen \
-		-I=proto/api \
-		-I=proto/dependencies \
-		--root=proto/internal \
-		--rewrite-enum=BuildId_State:BuildId \
-		-p go-grpc_out=$(PROTO_PATHS) \
-		-p go-helpers_out=$(PROTO_PATHS)
-	@mv -f "$(PROTO_OUT)/temporal/server/api/"* "$(PROTO_OUT)"
-
-# All gRPC generated service files paths relative to PROTO_OUT.
-PROTO_GRPC_SERVICES = $(patsubst $(PROTO_OUT)/%,%,$(shell find $(PROTO_OUT) -name "service.pb.go" -o -name "service_grpc.pb.go"))
-service_name = $(firstword $(subst /, ,$(1)))
-mock_file_name = $(call service_name,$(1))mock/$(subst $(call service_name,$(1))/,,$(1:go=mock.go))
-
-proto-mocks: protoc
-	@printf $(COLOR) "Generate proto mocks..."
-	$(foreach PROTO_GRPC_SERVICE,$(PROTO_GRPC_SERVICES),\
-		@cd $(PROTO_OUT) && \
-		mockgen -copyright_file ../LICENSE -package $(call service_name,$(PROTO_GRPC_SERVICE))mock -source $(PROTO_GRPC_SERVICE) -destination $(call mock_file_name,$(PROTO_GRPC_SERVICE)) \
-	$(NEWLINE))
-
-service-clients:
+proto-codegen:
 	@printf $(COLOR) "Generate service clients..."
-	@go generate ./client/...
+	@go generate -run genrpcwrappers ./client/...
+	@printf $(COLOR) "Generate server interceptors..."
+	@go generate ./common/rpc/interceptor/logtags/...
+	@printf $(COLOR) "Generate search attributes helpers..."
+	@go generate -run gensearchattributehelpers ./common/searchattribute/...
 
 update-go-api:
 	@printf $(COLOR) "Update go.temporal.io/api@master..."
 	@go get -u go.temporal.io/api@master
 
-goimports-proto:
-	@printf $(COLOR) "Run goimports for proto files..."
-	@goimports -w $(PROTO_OUT)
-
-copyright-proto:
-	@printf $(COLOR) "Update license headers for proto files..."
-	@go run ./cmd/tools/copyright/licensegen.go --scanDir $(PROTO_OUT)
-
 ##### Binaries #####
 clean-bins:
 	@printf $(COLOR) "Delete old binaries..."
 	@rm -f temporal-server
+	@rm -f temporal-server-debug
 	@rm -f temporal-cassandra-tool
 	@rm -f tdbg
 	@rm -f temporal-sql-tool
@@ -261,33 +335,39 @@ copyright:
 	@printf $(COLOR) "Fix license header..."
 	@go run ./cmd/tools/copyright/licensegen.go
 
-goimports: MERGE_BASE ?= $(shell test -d .git && git merge-base $(MAIN_BRANCH) HEAD)
-goimports: MODIFIED_FILES := $(shell test -d .git && git diff --name-status $(MERGE_BASE) -- | cut -f2)
-goimports:
-	@printf $(COLOR) "Run goimports for modified files..."
-	@printf "Merge base: $(MERGE_BASE)\n"
-	@printf "Modified files: $(MODIFIED_FILES)\n"
-	@goimports -w $(filter %.go, $(MODIFIED_FILES))
 
-lint:
+goimports: fmt-imports
+	@printf $(COLOR) "Run goimports for all files..."
+	@UNGENERATED_FILES=$$(find . -type f -name '*.go' -print0 | xargs -0 grep -L -e "Code generated by .* DO NOT EDIT." || true) && \
+		$(GOIMPORTS) -w $$UNGENERATED_FILES
+
+lint-actions: $(ACTIONLINT)
+	@printf $(COLOR) "Linting GitHub actions..."
+	@$(ACTIONLINT)
+
+lint-code: $(GOLANGCI_LINT)
+	@printf $(COLOR) "Linting code..."
+	@$(GOLANGCI_LINT) run --verbose --build-tags $(ALL_TEST_TAGS) --timeout 10m --fix=$(GOLANGCI_LINT_FIX) --new-from-rev=$(GOLANGCI_LINT_BASE_REV) --config=.golangci.yml
+
+fmt-imports: $(GCI) # Don't get confused, there is a single linter called gci, which is a part of the mega linter we use is called golangci-lint.
+	@printf $(COLOR) "Formatting imports..."
+	@$(GCI) write --skip-generated -s standard -s default ./*
+
+lint: lint-code lint-actions lint-api lint-protos
 	@printf $(COLOR) "Run linters..."
-	@golangci-lint run --verbose --timeout 10m --fix=true --new-from-rev=$(MAIN_BRANCH) --config=.golangci.yml
 
-api-linter:
-	@printf $(COLOR) "Run api-linter..."
-	$(call silent_exec, api-linter --set-exit-status $(PROTO_IMPORTS) --config=$(PROTO_ROOT)/api-linter.yaml $(PROTO_FILES))
+lint-api: $(API_LINTER) $(API_BINPB)
+	@printf $(COLOR) "Linting proto API..."
+	$(call silent_exec, $(API_LINTER) --set-exit-status -I=$(PROTO_ROOT)/internal --descriptor-set-in $(API_BINPB) --config=$(PROTO_ROOT)/api-linter.yaml $(PROTO_FILES))
 
-buf-lint:
-	@printf $(COLOR) "Run buf linter..."
-	@(cd $(PROTO_ROOT) && buf lint)
+lint-protos: $(BUF) $(INTERNAL_BINPB)
+	@printf $(COLOR) "Linting proto definitions..."
+	@$(BUF) lint $(INTERNAL_BINPB)
 
-buf-build:
-	@printf $(COLOR) "Build image.bin with buf..."
-	@(cd $(PROTO_ROOT) && buf build -o image.bin)
-
-buf-breaking:
-	@printf $(COLOR) "Run buf breaking changes check against image.bin..."
-	@(cd $(PROTO_ROOT) && buf check breaking --against image.bin)
+buf-breaking: $(BUF) $(API_BINPB) $(INTERNAL_BINPB)
+	@printf $(COLOR) "Run buf breaking proto changes check..."
+	@env BUF=$(BUF) API_BINPB=$(API_BINPB) INTERNAL_BINPB=$(INTERNAL_BINPB) MAIN_BRANCH=$(MAIN_BRANCH) \
+		./develop/buf-breaking.sh
 
 shell-check:
 	@printf $(COLOR) "Run shellcheck for script files..."
@@ -306,66 +386,72 @@ build-tests:
 
 unit-test: clean-test-results
 	@printf $(COLOR) "Run unit tests..."
-	@go test $(UNIT_TEST_DIRS) -timeout=$(TEST_TIMEOUT) $(TEST_TAG_FLAG) $(TEST_ARGS) 2>&1 | tee -a test.log
+	@go test $(UNIT_TEST_DIRS) $(COMPILED_TEST_ARGS) 2>&1 | tee -a test.log
 	@! grep -q "^--- FAIL" test.log
 
 integration-test: clean-test-results
 	@printf $(COLOR) "Run integration tests..."
-	@go test $(INTEGRATION_TEST_DIRS) -timeout=$(TEST_TIMEOUT) $(TEST_TAG_FLAG) $(TEST_ARGS) 2>&1 | tee -a test.log
+	@go test $(INTEGRATION_TEST_DIRS) $(COMPILED_TEST_ARGS) 2>&1 | tee -a test.log
 	@! grep -q "^--- FAIL" test.log
 
 functional-test: clean-test-results
 	@printf $(COLOR) "Run functional tests..."
-	@go test $(FUNCTIONAL_TEST_ROOT) -timeout=$(TEST_TIMEOUT) $(TEST_TAG_FLAG) $(TEST_ARGS) -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) 2>&1 | tee -a test.log
-	@go test $(FUNCTIONAL_TEST_NDC_ROOT) -timeout=$(TEST_TIMEOUT) $(TEST_TAG_FLAG) $(TEST_ARGS) -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) 2>&1 | tee -a test.log
-# Need to run xdc tests with race detector off because of ringpop bug causing data race issue.
-	@go test $(FUNCTIONAL_TEST_XDC_ROOT) -timeout=$(TEST_TIMEOUT) $(TEST_TAG_FLAG) -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) 2>&1 | tee -a test.log
+	@go test $(FUNCTIONAL_TEST_ROOT) $(COMPILED_TEST_ARGS) -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) 2>&1 | tee -a test.log
+	@go test $(FUNCTIONAL_TEST_NDC_ROOT) $(COMPILED_TEST_ARGS) -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) 2>&1 | tee -a test.log
+	@go test $(FUNCTIONAL_TEST_XDC_ROOT) $(COMPILED_TEST_ARGS) -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) 2>&1 | tee -a test.log
 	@! grep -q "^--- FAIL" test.log
 
 functional-with-fault-injection-test: clean-test-results
 	@printf $(COLOR) "Run integration tests with fault injection..."
-	@go test $(FUNCTIONAL_TEST_ROOT) -timeout=$(TEST_TIMEOUT) $(TEST_TAG_FLAG) $(TEST_ARGS) -PersistenceFaultInjectionRate=0.005 -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) 2>&1 | tee -a test.log
-	@go test $(FUNCTIONAL_TEST_NDC_ROOT) -timeout=$(TEST_TIMEOUT) $(TEST_TAG_FLAG) $(TEST_ARGS) -PersistenceFaultInjectionRate=0.005 -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) 2>&1 | tee -a test.log
-# Need to run xdc tests with race detector off because of ringpop bug causing data race issue.
-	@go test $(FUNCTIONAL_TEST_XDC_ROOT) -timeout=$(TEST_TIMEOUT) $(TEST_TAG_FLAG) -PersistenceFaultInjectionRate=0.005 -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) 2>&1 | tee -a test.log
+	@go test $(FUNCTIONAL_TEST_ROOT) $(COMPILED_TEST_ARGS) -FaultInjectionConfigFile=testdata/fault_injection.yaml -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) 2>&1 | tee -a test.log
+	@go test $(FUNCTIONAL_TEST_NDC_ROOT) $(COMPILED_TEST_ARGS) -FaultInjectionConfigFile=testdata/fault_injection.yaml -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) 2>&1 | tee -a test.log
+	@go test $(FUNCTIONAL_TEST_XDC_ROOT) $(COMPILED_TEST_ARGS) -FaultInjectionConfigFile=testdata/fault_injection.yaml -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) 2>&1 | tee -a test.log
 	@! grep -q "^--- FAIL" test.log
 
-test: unit-test integration-test functional-test functional-with-fault-injection-test
+test: unit-test integration-test functional-test
 
 ##### Coverage & Reporting #####
 $(TEST_OUTPUT_ROOT):
 	@mkdir -p $(TEST_OUTPUT_ROOT)
 
-prepare-coverage-test: update-gotestsum $(TEST_OUTPUT_ROOT)
+prepare-coverage-test: $(GOTESTSUM) $(TEST_OUTPUT_ROOT)
 
 unit-test-coverage: prepare-coverage-test
 	@printf $(COLOR) "Run unit tests with coverage..."
-	@gotestsum --junitfile $(NEW_REPORT) -- \
-		$(UNIT_TEST_DIRS) -timeout=$(TEST_TIMEOUT) -race $(TEST_TAG_FLAG) -coverprofile=$(NEW_COVER_PROFILE)
+	go run ./cmd/tools/test-runner $(GOTESTSUM) -retries $(FAILED_TEST_RETRIES) --junitfile $(NEW_REPORT) --packages $(UNIT_TEST_DIRS) -- \
+		$(COMPILED_TEST_ARGS) \
+		-coverprofile=$(NEW_COVER_PROFILE)
 
 integration-test-coverage: prepare-coverage-test
 	@printf $(COLOR) "Run integration tests with coverage..."
-	@gotestsum --junitfile $(NEW_REPORT) -- \
-		$(INTEGRATION_TEST_DIRS) -timeout=$(TEST_TIMEOUT) $(TEST_TAG_FLAG) $(INTEGRATION_TEST_COVERPKG) -coverprofile=$(NEW_COVER_PROFILE)
+	go run ./cmd/tools/test-runner $(GOTESTSUM) -retries $(FAILED_TEST_RETRIES) --junitfile $(NEW_REPORT) --packages $(INTEGRATION_TEST_DIRS) -- \
+		$(COMPILED_TEST_ARGS) \
+		-coverprofile=$(NEW_COVER_PROFILE) $(INTEGRATION_TEST_COVERPKG)
 
-# This should use the same build flags as functional-test-coverage for best build caching.
+# This should use the same build flags as functional-test-coverage and functional-test-{xdc,ndc}-coverage for best build caching.
 pre-build-functional-test-coverage: prepare-coverage-test
-	@go test -c -o /dev/null $(FUNCTIONAL_TEST_ROOT) -race $(TEST_TAG_FLAG) $(FUNCTIONAL_TEST_COVERPKG)
+	go test -c -o /dev/null $(FUNCTIONAL_TEST_ROOT) $(TEST_ARGS) $(TEST_TAG_FLAG) $(FUNCTIONAL_TEST_COVERPKG)
 
 functional-test-coverage: prepare-coverage-test
 	@printf $(COLOR) "Run functional tests with coverage with $(PERSISTENCE_DRIVER) driver..."
-	@gotestsum --junitfile $(NEW_REPORT) -- \
-		$(FUNCTIONAL_TEST_ROOT) -timeout=$(TEST_TIMEOUT) $(TEST_ARGS) $(TEST_TAG_FLAG) -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) $(FUNCTIONAL_TEST_COVERPKG) -coverprofile=$(NEW_COVER_PROFILE)
+	go run ./cmd/tools/test-runner $(GOTESTSUM) -retries $(FAILED_TEST_RETRIES) --junitfile $(NEW_REPORT) --packages $(FUNCTIONAL_TEST_ROOT) -- \
+		$(COMPILED_TEST_ARGS) \
+		-coverprofile=$(NEW_COVER_PROFILE) $(FUNCTIONAL_TEST_COVERPKG) \
+		-args -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER)
 
 functional-test-xdc-coverage: prepare-coverage-test
 	@printf $(COLOR) "Run functional test for cross DC with coverage with $(PERSISTENCE_DRIVER) driver..."
-	@gotestsum --junitfile $(NEW_REPORT) -- \
-		$(FUNCTIONAL_TEST_XDC_ROOT) -timeout=$(TEST_TIMEOUT) $(TEST_TAG_FLAG) -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) $(FUNCTIONAL_TEST_COVERPKG) -coverprofile=$(NEW_COVER_PROFILE)
+	go run ./cmd/tools/test-runner $(GOTESTSUM) -retries $(FAILED_TEST_RETRIES) --junitfile $(NEW_REPORT) --packages $(FUNCTIONAL_TEST_XDC_ROOT) -- \
+		$(COMPILED_TEST_ARGS) \
+		-coverprofile=$(NEW_COVER_PROFILE) $(FUNCTIONAL_TEST_COVERPKG) \
+		-args -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER)
 
 functional-test-ndc-coverage: prepare-coverage-test
 	@printf $(COLOR) "Run functional test for NDC with coverage with $(PERSISTENCE_DRIVER) driver..."
-	@gotestsum --junitfile $(NEW_REPORT) -- \
-		$(FUNCTIONAL_TEST_NDC_ROOT) -timeout=$(TEST_TIMEOUT) $(TEST_ARGS) $(TEST_TAG_FLAG) -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER) $(FUNCTIONAL_TEST_COVERPKG) -coverprofile=$(NEW_COVER_PROFILE)
+	go run ./cmd/tools/test-runner $(GOTESTSUM) -retries $(FAILED_TEST_RETRIES) --junitfile $(NEW_REPORT) --packages $(FUNCTIONAL_TEST_NDC_ROOT) -- \
+		$(COMPILED_TEST_ARGS) \
+		-coverprofile=$(NEW_COVER_PROFILE) $(FUNCTIONAL_TEST_COVERPKG) \
+		-args -persistenceType=$(PERSISTENCE_TYPE) -persistenceDriver=$(PERSISTENCE_DRIVER)
 
 .PHONY: $(SUMMARY_COVER_PROFILE)
 $(SUMMARY_COVER_PROFILE):
@@ -424,6 +510,7 @@ install-schema-es:
 	curl --fail -X PUT "http://127.0.0.1:9200/_template/temporal_visibility_v1_template" -H "Content-Type: application/json" --data-binary @./schema/elasticsearch/visibility/index_template_v7.json --write-out "\n"
 # No --fail here because create index is not idempotent operation.
 	curl -X PUT "http://127.0.0.1:9200/temporal_visibility_v1_dev" --write-out "\n"
+# curl -X PUT "http://127.0.0.1:9200/temporal_visibility_v1_secondary" --write-out "\n"
 
 install-schema-xdc: temporal-cassandra-tool
 	@printf $(COLOR)  "Install Cassandra schema (active)..."
@@ -475,6 +562,9 @@ start: start-sqlite
 start-cass-es: temporal-server
 	./temporal-server --env development-cass-es --allow-no-auth start
 
+start-cass-es-custom: temporal-server
+	./temporal-server --env development-cass-es-custom --allow-no-auth start
+
 start-es-fi: temporal-server
 	./temporal-server --env development-cass-es-fi --allow-no-auth start
 
@@ -518,9 +608,10 @@ update-dependencies:
 	@go get -u -t $(PINNED_DEPENDENCIES) ./...
 	@go mod tidy
 
-go-generate:
+go-generate: $(MOCKGEN) $(GOIMPORTS) $(STRINGER) $(GOWRAP)
 	@printf $(COLOR) "Process go:generate directives..."
 	@go generate ./...
+	$(MAKE) copyright
 
 ensure-no-changes:
 	@printf $(COLOR) "Check for local changes..."

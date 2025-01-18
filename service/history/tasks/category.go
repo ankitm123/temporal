@@ -25,6 +25,7 @@
 package tasks
 
 import (
+	"fmt"
 	"strconv"
 )
 
@@ -47,7 +48,7 @@ const (
 	CategoryIDVisibility  = 4
 	CategoryIDArchival    = 5
 	CategoryIDMemoryTimer = 6
-	CategoryIDCallback    = 7
+	CategoryIDOutbound    = 7
 )
 
 const (
@@ -63,7 +64,7 @@ const (
 	categoryNameVisibility  = "visibility"
 	categoryNameArchival    = "archival"
 	categoryNameMemoryTimer = "memory-timer"
-	categoryNameCallback    = "callback"
+	categoryNameOutbound    = "outbound"
 )
 
 var (
@@ -103,10 +104,10 @@ var (
 		name:  categoryNameMemoryTimer,
 	}
 
-	CategoryCallback = Category{
-		id:    CategoryIDCallback,
+	CategoryOutbound = Category{
+		id:    CategoryIDOutbound,
 		cType: CategoryTypeImmediate,
-		name:  categoryNameCallback,
+		name:  categoryNameOutbound,
 	}
 )
 
@@ -128,6 +129,10 @@ func (c Category) Name() string {
 
 func (c Category) Type() CategoryType {
 	return c.cType
+}
+
+func (c Category) MarshalText() (text []byte, err error) {
+	return []byte(fmt.Sprintf("%s(id:%d, type:%s)", c.name, c.id, c.cType)), nil
 }
 
 func (t CategoryType) String() string {

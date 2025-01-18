@@ -31,10 +31,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
-
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/backoff"
@@ -52,7 +50,6 @@ type (
 	}
 
 	writeTaskRequest struct {
-		execution  *commonpb.WorkflowExecution
 		taskInfo   *persistencespb.TaskInfo
 		responseCh chan<- *writeTaskResponse
 	}
@@ -62,18 +59,21 @@ type (
 		end   int64
 	}
 
+	idBlockAllocator interface {
+		RenewLease(context.Context) (taskQueueState, error)
+		RangeID() int64
+	}
+
 	// taskWriter writes tasks sequentially to persistence
 	taskWriter struct {
-		status       int32
-		tlMgr        *taskQueueManagerImpl
-		config       *taskQueueConfig
-		taskQueueID  *taskQueueID
-		appendCh     chan *writeTaskRequest
-		taskIDBlock  taskIDBlock
-		maxReadLevel int64
-		logger       log.Logger
-		writeLoop    *goro.Handle
-		idAlloc      idBlockAllocator
+		status      int32
+		backlogMgr  *backlogManagerImpl
+		config      *taskQueueConfig
+		appendCh    chan *writeTaskRequest
+		taskIDBlock taskIDBlock
+		logger      log.Logger
+		writeLoop   *goro.Handle
+		idAlloc     idBlockAllocator
 	}
 )
 
@@ -86,21 +86,21 @@ var (
 )
 
 func newTaskWriter(
-	tlMgr *taskQueueManagerImpl,
+	backlogMgr *backlogManagerImpl,
 ) *taskWriter {
 	return &taskWriter{
-		status:       common.DaemonStatusInitialized,
-		tlMgr:        tlMgr,
-		config:       tlMgr.config,
-		taskQueueID:  tlMgr.taskQueueID,
-		appendCh:     make(chan *writeTaskRequest, tlMgr.config.OutstandingTaskAppendsThreshold()),
-		taskIDBlock:  noTaskIDs,
-		maxReadLevel: noTaskIDs.start - 1,
-		logger:       tlMgr.logger,
-		idAlloc:      tlMgr.db,
+		status:      common.DaemonStatusInitialized,
+		backlogMgr:  backlogMgr,
+		config:      backlogMgr.config,
+		appendCh:    make(chan *writeTaskRequest, backlogMgr.config.OutstandingTaskAppendsThreshold()),
+		taskIDBlock: noTaskIDs,
+		logger:      backlogMgr.logger,
+		idAlloc:     backlogMgr.db,
+		writeLoop:   goro.NewHandle(backlogMgr.contextInfoProvider(context.Background())),
 	}
 }
 
+// Start taskWriter background goroutine.
 func (w *taskWriter) Start() {
 	if !atomic.CompareAndSwapInt32(
 		&w.status,
@@ -110,11 +110,11 @@ func (w *taskWriter) Start() {
 		return
 	}
 
-	w.writeLoop = goro.NewHandle(w.tlMgr.callerInfoContext(context.Background()))
 	w.writeLoop.Go(w.taskWriterLoop)
 }
 
-// Stop stops the taskWriter
+// Stop stops the taskWriter.
+// Note that this does not wait until the background goroutine has exited!
 func (w *taskWriter) Stop() {
 	if !atomic.CompareAndSwapInt32(
 		&w.status,
@@ -137,13 +137,12 @@ func (w *taskWriter) initReadWriteState(ctx context.Context) error {
 		return err
 	}
 	w.taskIDBlock = rangeIDToTaskIDBlock(state.rangeID, w.config.RangeSize)
-	atomic.StoreInt64(&w.maxReadLevel, w.taskIDBlock.start-1)
-	w.tlMgr.taskAckManager.setAckLevel(state.ackLevel)
+	w.backlogMgr.db.SetMaxReadLevel(w.taskIDBlock.start - 1)
+	w.backlogMgr.taskAckManager.setAckLevel(state.ackLevel)
 	return nil
 }
 
 func (w *taskWriter) appendTask(
-	execution *commonpb.WorkflowExecution,
 	taskInfo *persistencespb.TaskInfo,
 ) (*persistence.CreateTasksResponse, error) {
 
@@ -157,7 +156,6 @@ func (w *taskWriter) appendTask(
 	startTime := time.Now().UTC()
 	ch := make(chan *writeTaskResponse)
 	req := &writeTaskRequest{
-		execution:  execution,
 		taskInfo:   taskInfo,
 		responseCh: ch,
 	}
@@ -166,7 +164,7 @@ func (w *taskWriter) appendTask(
 	case w.appendCh <- req:
 		select {
 		case r := <-ch:
-			metrics.TaskWriteLatencyPerTaskQueue.With(w.tlMgr.metricsHandler).Record(time.Since(startTime))
+			metrics.TaskWriteLatencyPerTaskQueue.With(w.backlogMgr.metricsHandler).Record(time.Since(startTime))
 			return r.persistenceResponse, r.err
 		case <-w.writeLoop.Done():
 			// if we are shutting down, this request will never make
@@ -174,15 +172,13 @@ func (w *taskWriter) appendTask(
 			return nil, errShutdown
 		}
 	default: // channel is full, throttle
-		metrics.TaskWriteThrottlePerTaskQueueCounter.With(w.tlMgr.metricsHandler).Record(1)
-		return nil, serviceerror.NewResourceExhausted(
-			enumspb.RESOURCE_EXHAUSTED_CAUSE_SYSTEM_OVERLOADED,
-			"Too many outstanding appends to the task queue")
+		metrics.TaskWriteThrottlePerTaskQueueCounter.With(w.backlogMgr.metricsHandler).Record(1)
+		return nil, &serviceerror.ResourceExhausted{
+			Cause:   enumspb.RESOURCE_EXHAUSTED_CAUSE_SYSTEM_OVERLOADED,
+			Scope:   enumspb.RESOURCE_EXHAUSTED_SCOPE_NAMESPACE,
+			Message: "Too many outstanding appends to the task queue",
+		}
 	}
-}
-
-func (w *taskWriter) GetMaxReadLevel() int64 {
-	return atomic.LoadInt64(&w.maxReadLevel)
 }
 
 func (w *taskWriter) allocTaskIDs(ctx context.Context, count int) ([]int64, error) {
@@ -204,17 +200,18 @@ func (w *taskWriter) allocTaskIDs(ctx context.Context, count int) ([]int64, erro
 
 func (w *taskWriter) appendTasks(
 	ctx context.Context,
-	tasks []*persistencespb.AllocatedTaskInfo,
+	taskIDs []int64,
+	reqs []*writeTaskRequest,
 ) (*persistence.CreateTasksResponse, error) {
 
-	resp, err := w.tlMgr.db.CreateTasks(ctx, tasks)
+	resp, err := w.backlogMgr.db.CreateTasks(ctx, taskIDs, reqs)
 	if err != nil {
-		w.tlMgr.signalIfFatal(err)
+		w.backlogMgr.signalIfFatal(err)
 		w.logger.Error("Persistent store operation failure",
 			tag.StoreOperationCreateTask,
 			tag.Error(err),
-			tag.WorkflowTaskQueueName(w.taskQueueID.FullName()),
-			tag.WorkflowTaskQueueType(w.taskQueueID.taskType))
+			tag.WorkflowTaskQueueName(w.backlogMgr.queueKey().PersistenceName()),
+			tag.WorkflowTaskQueueType(w.backlogMgr.queueKey().TaskType()))
 		return nil, err
 	}
 	return resp, nil
@@ -222,7 +219,7 @@ func (w *taskWriter) appendTasks(
 
 func (w *taskWriter) taskWriterLoop(ctx context.Context) error {
 	err := w.initReadWriteState(ctx)
-	w.tlMgr.SetInitializedError(err)
+	w.backlogMgr.SetInitializedError(err)
 
 writerLoop:
 	for {
@@ -233,29 +230,13 @@ writerLoop:
 			reqs = w.getWriteBatch(reqs)
 			batchSize := len(reqs)
 
-			maxReadLevel := int64(0)
-
 			taskIDs, err := w.allocTaskIDs(ctx, batchSize)
 			if err != nil {
 				w.sendWriteResponse(reqs, nil, err)
 				continue writerLoop
 			}
 
-			var tasks []*persistencespb.AllocatedTaskInfo
-			for i, req := range reqs {
-				tasks = append(tasks, &persistencespb.AllocatedTaskInfo{
-					TaskId: taskIDs[i],
-					Data:   req.taskInfo,
-				})
-				maxReadLevel = taskIDs[i]
-			}
-
-			resp, err := w.appendTasks(ctx, tasks)
-			// Update the maxReadLevel after the writes are completed, but before we send the response,
-			// so that taskReader is guaranteed to see the new read level when SpoolTask wakes it up.
-			if maxReadLevel > 0 {
-				atomic.StoreInt64(&w.maxReadLevel, maxReadLevel)
-			}
+			resp, err := w.appendTasks(ctx, taskIDs, reqs)
 			w.sendWriteResponse(reqs, resp, err)
 
 		case <-ctx.Done():
@@ -302,10 +283,10 @@ func (w *taskWriter) renewLeaseWithRetry(
 		newState, err = w.idAlloc.RenewLease(ctx)
 		return
 	}
-	metrics.LeaseRequestPerTaskQueueCounter.With(w.tlMgr.metricsHandler).Record(1)
+	metrics.LeaseRequestPerTaskQueueCounter.With(w.backlogMgr.metricsHandler).Record(1)
 	err := backoff.ThrottleRetryContext(ctx, op, retryPolicy, retryErrors)
 	if err != nil {
-		metrics.LeaseFailurePerTaskQueueCounter.With(w.tlMgr.metricsHandler).Record(1)
+		metrics.LeaseFailurePerTaskQueueCounter.With(w.backlogMgr.metricsHandler).Record(1)
 		return newState, err
 	}
 	return newState, nil
@@ -324,7 +305,7 @@ func (w *taskWriter) allocTaskIDBlock(ctx context.Context, prevBlockEnd int64) (
 	}
 	state, err := w.renewLeaseWithRetry(ctx, persistenceOperationRetryPolicy, common.IsPersistenceTransientError)
 	if err != nil {
-		if w.tlMgr.signalIfFatal(err) {
+		if w.backlogMgr.signalIfFatal(err) {
 			return taskIDBlock{}, errShutdown
 		}
 		return taskIDBlock{}, err

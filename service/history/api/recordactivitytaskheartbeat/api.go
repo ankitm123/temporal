@@ -59,10 +59,10 @@ func Invoke(
 	}
 
 	var cancelRequested bool
+	var activityPaused bool
 	err = api.GetAndUpdateWorkflowWithNew(
 		ctx,
 		token.Clock,
-		api.BypassMutableStateConsistencyPredicate,
 		definition.NewWorkflowKey(
 			token.NamespaceId,
 			token.WorkflowId,
@@ -99,7 +99,13 @@ func Invoke(
 				return nil, consts.ErrActivityTaskNotFound
 			}
 
+			// update worker identity if available
+			if req.HeartbeatRequest.Identity != "" {
+				ai.RetryLastWorkerIdentity = req.HeartbeatRequest.Identity
+			}
+
 			cancelRequested = ai.CancelRequested
+			activityPaused = ai.Paused
 
 			// Save progress and last HB reported time.
 			mutableState.UpdateActivityProgress(ai, request)
@@ -119,5 +125,6 @@ func Invoke(
 
 	return &historyservice.RecordActivityTaskHeartbeatResponse{
 		CancelRequested: cancelRequested,
+		ActivityPaused:  activityPaused,
 	}, nil
 }

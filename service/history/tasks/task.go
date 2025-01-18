@@ -42,15 +42,29 @@ type (
 		GetRunID() string
 		GetTaskID() int64
 		GetVisibilityTime() time.Time
-		GetVersion() int64
 		GetCategory() Category
 		GetType() enumsspb.TaskType
 
 		SetTaskID(id int64)
 		SetVisibilityTime(timestamp time.Time)
+
+		// TODO: All tasks should have a method returning the versioned transition
+		// in which the task is generated.
+		// This versioned transition can be used to determine if the task or
+		// the mutable state is stale.
 	}
 
-	// HasDestination must be implemented by all tasks used in multi-destination queues.
+	// HasVersion is a legacy method for tasks that uses only version to determine
+	// if the task should be executed or not.
+	HasVersion interface {
+		GetVersion() int64
+	}
+
+	// HasStateMachineTaskType must be implemented by all HSM state machine tasks.
+	HasStateMachineTaskType interface {
+		StateMachineTaskType() string
+	}
+	// HasDestination must be implemented by all tasks used in the outbound queue.
 	HasDestination interface {
 		GetDestination() string
 	}

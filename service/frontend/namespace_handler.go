@@ -37,8 +37,6 @@ import (
 	replicationpb "go.temporal.io/api/replication/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
-	"google.golang.org/protobuf/types/known/timestamppb"
-
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common"
@@ -46,30 +44,32 @@ import (
 	"go.temporal.io/server/common/archiver/provider"
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/cluster"
-	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/namespace/nsmanager"
+	"go.temporal.io/server/common/namespace/nsreplication"
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/primitives/timestamp"
 	"go.temporal.io/server/common/util"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type (
 	// namespaceHandler implements the namespace-related APIs specified by the [workflowservice] package,
 	// such as registering, updating, and querying namespaces.
 	namespaceHandler struct {
-		maxBadBinaryCount      dynamicconfig.IntPropertyFnWithNamespaceFilter
 		logger                 log.Logger
 		metadataMgr            persistence.MetadataManager
 		clusterMetadata        cluster.Metadata
-		namespaceReplicator    namespace.Replicator
-		namespaceAttrValidator *namespace.AttrValidatorImpl
+		namespaceReplicator    nsreplication.Replicator
+		namespaceAttrValidator *nsmanager.Validator
 		archivalMetadata       archiver.ArchivalMetadata
 		archiverProvider       provider.ArchiverProvider
-		supportsSchedules      dynamicconfig.BoolPropertyFnWithNamespaceFilter
 		timeSource             clock.TimeSource
+		config                 *Config
 	}
 )
 
@@ -89,27 +89,25 @@ var (
 
 // newNamespaceHandler create a new namespace handler
 func newNamespaceHandler(
-	maxBadBinaryCount dynamicconfig.IntPropertyFnWithNamespaceFilter,
 	logger log.Logger,
 	metadataMgr persistence.MetadataManager,
 	clusterMetadata cluster.Metadata,
-	namespaceReplicator namespace.Replicator,
+	namespaceReplicator nsreplication.Replicator,
 	archivalMetadata archiver.ArchivalMetadata,
 	archiverProvider provider.ArchiverProvider,
-	supportsSchedules dynamicconfig.BoolPropertyFnWithNamespaceFilter,
 	timeSource clock.TimeSource,
+	config *Config,
 ) *namespaceHandler {
 	return &namespaceHandler{
-		maxBadBinaryCount:      maxBadBinaryCount,
 		logger:                 logger,
 		metadataMgr:            metadataMgr,
 		clusterMetadata:        clusterMetadata,
 		namespaceReplicator:    namespaceReplicator,
-		namespaceAttrValidator: namespace.NewAttrValidator(clusterMetadata),
+		namespaceAttrValidator: nsmanager.NewValidator(clusterMetadata),
 		archivalMetadata:       archivalMetadata,
 		archiverProvider:       archiverProvider,
-		supportsSchedules:      supportsSchedules,
 		timeSource:             timeSource,
+		config:                 config,
 	}
 }
 
@@ -135,7 +133,7 @@ func (d *namespaceHandler) RegisterNamespace(
 	}
 
 	if err := validateRetentionDuration(
-		timestamp.DurationValue(registerRequest.WorkflowExecutionRetentionPeriod),
+		registerRequest.WorkflowExecutionRetentionPeriod,
 		registerRequest.IsGlobalNamespace,
 	); err != nil {
 		return nil, err
@@ -469,7 +467,7 @@ func (d *namespaceHandler) UpdateNamespace(
 
 			config.Retention = updatedConfig.GetWorkflowExecutionRetentionTtl()
 			if err := validateRetentionDuration(
-				timestamp.DurationValue(config.Retention),
+				config.Retention,
 				isGlobalNamespace,
 			); err != nil {
 				return nil, err
@@ -486,7 +484,7 @@ func (d *namespaceHandler) UpdateNamespace(
 			config.VisibilityArchivalUri = nextVisibilityArchivalState.URI
 		}
 		if updatedConfig.BadBinaries != nil {
-			maxLength := d.maxBadBinaryCount(updateRequest.GetNamespace())
+			maxLength := d.config.MaxBadBinaries(updateRequest.GetNamespace())
 			// only do merging
 			bb := d.mergeBadBinaries(config.BadBinaries.Binaries, updatedConfig.BadBinaries.Binaries, time.Now().UTC())
 			config.BadBinaries = &bb
@@ -700,7 +698,12 @@ func (d *namespaceHandler) createResponse(
 		Data:        info.Data,
 		Id:          info.Id,
 
-		SupportsSchedules: d.supportsSchedules(info.Name),
+		Capabilities: &namespacepb.NamespaceInfo_Capabilities{
+			EagerWorkflowStart: d.config.EnableEagerWorkflowStart(info.Name),
+			SyncUpdate:         d.config.EnableUpdateWorkflowExecution(info.Name),
+			AsyncUpdate:        d.config.EnableUpdateWorkflowExecutionAsyncAccepted(info.Name),
+		},
+		SupportsSchedules: d.config.EnableSchedules(info.Name),
 	}
 
 	configResult := &namespacepb.NamespaceConfig{
@@ -888,12 +891,16 @@ func (d *namespaceHandler) maybeUpdateFailoverHistory(
 }
 
 // validateRetentionDuration ensures that retention duration can't be set below a sane minimum.
-func validateRetentionDuration(retention time.Duration, isGlobalNamespace bool) error {
+func validateRetentionDuration(retention *durationpb.Duration, isGlobalNamespace bool) error {
+	if err := timestamp.ValidateProtoDuration(retention); err != nil {
+		return errInvalidRetentionPeriod
+	}
+
 	min := namespace.MinRetentionLocal
 	if isGlobalNamespace {
 		min = namespace.MinRetentionGlobal
 	}
-	if retention < min {
+	if timestamp.DurationValue(retention) < min {
 		return errInvalidRetentionPeriod
 	}
 	return nil

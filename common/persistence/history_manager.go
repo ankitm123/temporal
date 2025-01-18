@@ -33,7 +33,6 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/serviceerror"
-
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/log/tag"
@@ -46,6 +45,10 @@ const (
 
 	// TrimHistoryBranch will only dump metadata, relatively cheap
 	trimHistoryBranchPageSize = 1000
+	dataLossMsg               = "Potential data loss"
+	errNonContiguousEventID   = "corrupted history event batch, eventID is not contiguous"
+	errWrongVersion           = "corrupted history event batch, wrong version and IDs"
+	errEmptyEvents            = "corrupted history event batch, empty events"
 )
 
 var _ ExecutionManager = (*executionManagerImpl)(nil)
@@ -102,7 +105,11 @@ func (m *executionManagerImpl) ForkHistoryBranch(
 	// The above newBranchInfo is a lossy construction of the forked branch token from the original opaque branch token.
 	// It only initializes with the fields it understands, which may inadvertently discard other misc fields. The
 	// following is the replacement logic to correctly apply the updated fields into the original opaque branch token.
-	newBranchToken, err := m.GetHistoryBranchUtil().UpdateHistoryBranchInfo(request.ForkBranchToken, newBranchInfo)
+	newBranchToken, err := m.GetHistoryBranchUtil().UpdateHistoryBranchInfo(
+		request.ForkBranchToken,
+		newBranchInfo,
+		request.NewRunID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -120,13 +127,13 @@ func (m *executionManagerImpl) ForkHistoryBranch(
 	}
 
 	req := &InternalForkHistoryBranchRequest{
-		ForkBranchToken: request.ForkBranchToken,
-		ForkBranchInfo:  forkBranch,
-		TreeInfo:        treeInfoBlob,
-		ForkNodeID:      request.ForkNodeID,
-		NewBranchID:     newBranchInfo.BranchId,
-		Info:            request.Info,
-		ShardID:         request.ShardID,
+		NewBranchToken: newBranchToken,
+		ForkBranchInfo: forkBranch,
+		TreeInfo:       treeInfoBlob,
+		ForkNodeID:     request.ForkNodeID,
+		NewBranchID:    newBranchInfo.BranchId,
+		Info:           request.Info,
+		ShardID:        request.ShardID,
 	}
 
 	err = m.persistence.ForkHistoryBranch(ctx, req)
@@ -924,35 +931,44 @@ func (m *executionManagerImpl) readHistoryBranch(
 	historyEvents := make([]*historypb.HistoryEvent, 0, request.PageSize)
 	historyEventBatches := make([]*historypb.History, 0, request.PageSize)
 
+	var firstEvent, lastEvent *historypb.HistoryEvent
+	var eventCount int
+
+	dataLossTags := func(cause string) []tag.Tag {
+		return []tag.Tag{
+			tag.Cause(cause),
+			tag.WorkflowBranchToken(request.BranchToken),
+			tag.WorkflowFirstEventID(firstEvent.GetEventId()),
+			tag.FirstEventVersion(firstEvent.GetVersion()),
+			tag.WorkflowNextEventID(lastEvent.GetEventId()),
+			tag.LastEventVersion(lastEvent.GetVersion()),
+			tag.Counter(eventCount),
+			tag.TokenLastEventID(token.LastEventID),
+		}
+	}
+
 	for _, batch := range dataBlobs {
 		events, err := m.serializer.DeserializeEvents(batch)
 		if err != nil {
 			return nil, nil, nil, nil, dataSize, err
 		}
 		if len(events) == 0 {
-			m.logger.Error("Empty events in a batch")
-			return nil, nil, nil, nil, dataSize, serviceerror.NewDataLoss("corrupted history event batch, empty events")
+			m.logger.Error(dataLossMsg, dataLossTags(errEmptyEvents)...)
+			return nil, nil, nil, nil, dataSize, serviceerror.NewDataLoss(errEmptyEvents)
 		}
 
-		firstEvent := events[0]           // first
-		eventCount := len(events)         // length
-		lastEvent := events[eventCount-1] // last
+		firstEvent = events[0]
+		eventCount = len(events)
+		lastEvent = events[eventCount-1]
 
 		if firstEvent.GetVersion() != lastEvent.GetVersion() || firstEvent.GetEventId()+int64(eventCount-1) != lastEvent.GetEventId() {
 			// in a single batch, version should be the same, and ID should be contiguous
-			m.logger.Error("Corrupted event batch",
-				tag.FirstEventVersion(firstEvent.GetVersion()), tag.WorkflowFirstEventID(firstEvent.GetEventId()),
-				tag.LastEventVersion(lastEvent.GetVersion()), tag.WorkflowNextEventID(lastEvent.GetEventId()),
-				tag.Counter(eventCount))
-			return historyEvents, historyEventBatches, transactionIDs, nil, dataSize, serviceerror.NewDataLoss("corrupted history event batch, wrong version and IDs")
+			m.logger.Error(dataLossMsg, dataLossTags(errWrongVersion)...)
+			return historyEvents, historyEventBatches, transactionIDs, nil, dataSize, serviceerror.NewDataLoss(errWrongVersion)
 		}
 		if firstEvent.GetEventId() != token.LastEventID+1 {
-			m.logger.Error("Corrupted non-contiguous event batch",
-				tag.WorkflowFirstEventID(firstEvent.GetEventId()),
-				tag.WorkflowNextEventID(lastEvent.GetEventId()),
-				tag.TokenLastEventID(token.LastEventID),
-				tag.Counter(eventCount))
-			return historyEvents, historyEventBatches, transactionIDs, nil, dataSize, serviceerror.NewDataLoss("corrupted history event batch, eventID is not contiguous")
+			m.logger.Error(dataLossMsg, dataLossTags(errNonContiguousEventID)...)
+			return historyEvents, historyEventBatches, transactionIDs, nil, dataSize, serviceerror.NewDataLoss(errNonContiguousEventID)
 		}
 
 		if byBatch {
@@ -982,35 +998,44 @@ func (m *executionManagerImpl) readHistoryBranchReverse(
 
 	historyEvents := make([]*historypb.HistoryEvent, 0, request.PageSize)
 
+	var firstEvent, lastEvent *historypb.HistoryEvent
+	var eventCount int
+
+	datalossTags := func(cause string) []tag.Tag {
+		return []tag.Tag{
+			tag.Cause(cause),
+			tag.WorkflowBranchToken(request.BranchToken),
+			tag.WorkflowFirstEventID(firstEvent.GetEventId()),
+			tag.FirstEventVersion(firstEvent.GetVersion()),
+			tag.WorkflowNextEventID(lastEvent.GetEventId()),
+			tag.LastEventVersion(lastEvent.GetVersion()),
+			tag.Counter(eventCount),
+			tag.TokenLastEventID(token.LastEventID),
+		}
+	}
+
 	for _, batch := range dataBlobs {
 		events, err := m.serializer.DeserializeEvents(batch)
 		if err != nil {
 			return nil, nil, nil, dataSize, err
 		}
 		if len(events) == 0 {
-			m.logger.Error("Empty events in a batch")
-			return nil, nil, nil, dataSize, serviceerror.NewDataLoss("corrupted history event batch, empty events")
+			m.logger.Error(dataLossMsg, datalossTags(errEmptyEvents)...)
+			return nil, nil, nil, dataSize, serviceerror.NewDataLoss(errEmptyEvents)
 		}
 
-		firstEvent := events[0]           // first
-		eventCount := len(events)         // length
-		lastEvent := events[eventCount-1] // last
+		firstEvent = events[0]
+		eventCount = len(events)
+		lastEvent = events[eventCount-1]
 
 		if firstEvent.GetVersion() != lastEvent.GetVersion() || firstEvent.GetEventId()+int64(eventCount-1) != lastEvent.GetEventId() {
 			// in a single batch, version should be the same, and ID should be contiguous
-			m.logger.Error("Corrupted event batch",
-				tag.FirstEventVersion(firstEvent.GetVersion()), tag.WorkflowFirstEventID(firstEvent.GetEventId()),
-				tag.LastEventVersion(lastEvent.GetVersion()), tag.WorkflowNextEventID(lastEvent.GetEventId()),
-				tag.Counter(eventCount))
-			return historyEvents, transactionIDs, nil, dataSize, serviceerror.NewDataLoss("corrupted history event batch, wrong version and IDs")
+			m.logger.Error(dataLossMsg, datalossTags(errWrongVersion)...)
+			return historyEvents, transactionIDs, nil, dataSize, serviceerror.NewDataLoss(errWrongVersion)
 		}
 		if (token.LastEventID != common.EmptyEventID) && (lastEvent.GetEventId() != token.LastEventID-1) {
-			m.logger.Error("Corrupted non-contiguous event batch",
-				tag.WorkflowFirstEventID(firstEvent.GetEventId()),
-				tag.WorkflowNextEventID(lastEvent.GetEventId()),
-				tag.TokenLastEventID(token.LastEventID),
-				tag.Counter(eventCount))
-			return historyEvents, transactionIDs, nil, dataSize, serviceerror.NewDataLoss("corrupted history event batch, eventID is not contiguous")
+			m.logger.Error(dataLossMsg, datalossTags(errNonContiguousEventID)...)
+			return historyEvents, transactionIDs, nil, dataSize, serviceerror.NewDataLoss(errNonContiguousEventID)
 		}
 
 		events = m.reverseSlice(events)

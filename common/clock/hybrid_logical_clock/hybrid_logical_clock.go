@@ -27,11 +27,12 @@ package hybrid_logical_clock
 import (
 	"time"
 
-	clockpb "go.temporal.io/server/api/clock/v1"
+	clockspb "go.temporal.io/server/api/clock/v1"
 	commonclock "go.temporal.io/server/common/clock"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-type Clock = clockpb.HybridLogicalClock
+type Clock = clockspb.HybridLogicalClock
 
 // Next generates the next clock timestamp given the current clock.
 // HybridLogicalClock requires the previous clock to ensure that time doesn't move backwards and the next clock is
@@ -119,4 +120,9 @@ func UTC(c *Clock) time.Time {
 // Since returns time.Since(UTC(c))
 func Since(c *Clock) time.Duration {
 	return time.Since(UTC(c))
+}
+
+// ProtoTimestamp returns timestamppb.New(UTC(c))
+func ProtoTimestamp(c *Clock) *timestamppb.Timestamp {
+	return timestamppb.New(UTC(c))
 }

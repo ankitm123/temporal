@@ -35,7 +35,6 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
-
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
@@ -428,27 +427,6 @@ func (m *sqlTaskManager) GetTasks(
 	}
 
 	return response, nil
-}
-
-func (m *sqlTaskManager) CompleteTask(
-	ctx context.Context,
-	request *persistence.CompleteTaskRequest,
-) error {
-	nidBytes, err := primitives.ParseUUID(request.TaskQueue.NamespaceID)
-	if err != nil {
-		return serviceerror.NewUnavailable(err.Error())
-	}
-
-	taskID := request.TaskID
-	tqId, tqHash := m.taskQueueIdAndHash(nidBytes, request.TaskQueue.TaskQueueName, request.TaskQueue.TaskQueueType)
-	_, err = m.Db.DeleteFromTasks(ctx, sqlplugin.TasksFilter{
-		RangeHash:   tqHash,
-		TaskQueueID: tqId,
-		TaskID:      &taskID})
-	if err != nil && err != sql.ErrNoRows {
-		return serviceerror.NewUnavailable(err.Error())
-	}
-	return nil
 }
 
 func (m *sqlTaskManager) CompleteTasksLessThan(

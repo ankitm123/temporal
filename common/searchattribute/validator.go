@@ -30,7 +30,6 @@ import (
 
 	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/api/serviceerror"
-
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/payload"
@@ -49,6 +48,10 @@ type (
 
 		// allowList allows list of values when it's not keyword list type.
 		allowList dynamicconfig.BoolPropertyFnWithNamespaceFilter
+
+		// suppressErrorSetSystemSearchAttribute suppresses errors when the user
+		// attempts to set values in system search attributes.
+		suppressErrorSetSystemSearchAttribute dynamicconfig.BoolPropertyFnWithNamespaceFilter
 	}
 )
 
@@ -61,22 +64,24 @@ func NewValidator(
 	searchAttributesTotalSizeLimit dynamicconfig.IntPropertyFnWithNamespaceFilter,
 	visibilityManager manager.VisibilityManager,
 	allowList dynamicconfig.BoolPropertyFnWithNamespaceFilter,
+	suppressErrorSetSystemSearchAttribute dynamicconfig.BoolPropertyFnWithNamespaceFilter,
 ) *Validator {
 	return &Validator{
-		searchAttributesProvider:          searchAttributesProvider,
-		searchAttributesMapperProvider:    searchAttributesMapperProvider,
-		searchAttributesNumberOfKeysLimit: searchAttributesNumberOfKeysLimit,
-		searchAttributesSizeOfValueLimit:  searchAttributesSizeOfValueLimit,
-		searchAttributesTotalSizeLimit:    searchAttributesTotalSizeLimit,
-		visibilityManager:                 visibilityManager,
-		allowList:                         allowList,
+		searchAttributesProvider:              searchAttributesProvider,
+		searchAttributesMapperProvider:        searchAttributesMapperProvider,
+		searchAttributesNumberOfKeysLimit:     searchAttributesNumberOfKeysLimit,
+		searchAttributesSizeOfValueLimit:      searchAttributesSizeOfValueLimit,
+		searchAttributesTotalSizeLimit:        searchAttributesTotalSizeLimit,
+		visibilityManager:                     visibilityManager,
+		allowList:                             allowList,
+		suppressErrorSetSystemSearchAttribute: suppressErrorSetSystemSearchAttribute,
 	}
 }
 
 // Validate search attributes are valid for writing.
 // The search attributes must be unaliased before calling validation.
 func (v *Validator) Validate(searchAttributes *commonpb.SearchAttributes, namespace string) error {
-	if searchAttributes == nil {
+	if len(searchAttributes.GetIndexedFields()) == 0 {
 		return nil
 	}
 
@@ -105,6 +110,10 @@ func (v *Validator) Validate(searchAttributes *commonpb.SearchAttributes, namesp
 	for saFieldName, saPayload := range searchAttributes.GetIndexedFields() {
 		// user search attribute cannot be a system search attribute
 		if _, err = saTypeMap.getType(saFieldName, systemCategory); err == nil {
+			if v.suppressErrorSetSystemSearchAttribute(namespace) {
+				// if suppressing the error, then just ignore the search attribute
+				continue
+			}
 			return serviceerror.NewInvalidArgument(
 				fmt.Sprintf("%s attribute can't be set in SearchAttributes", saFieldName),
 			)

@@ -26,18 +26,18 @@ package authorization
 
 import (
 	"context"
+	"errors"
 	"testing"
 
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.temporal.io/api/workflowservice/v1"
-	"go.temporal.io/api/workflowservicemock/v1"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
-
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
+	"go.temporal.io/server/common/namespace"
+	"go.uber.org/mock/gomock"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 const (
@@ -59,14 +59,15 @@ type (
 		suite.Suite
 		*require.Assertions
 
-		controller          *gomock.Controller
-		mockFrontendHandler *workflowservicemock.MockWorkflowServiceServer
-		mockAuthorizer      *MockAuthorizer
-		mockMetricsHandler  *metrics.MockHandler
-		interceptor         *Interceptor
-		handler             grpc.UnaryHandler
-		mockClaimMapper     *MockClaimMapper
+		controller         *gomock.Controller
+		mockAuthorizer     *MockAuthorizer
+		mockMetricsHandler *metrics.MockHandler
+		interceptor        *Interceptor
+		handler            grpc.UnaryHandler
+		mockClaimMapper    *MockClaimMapper
 	}
+
+	mockNamespaceChecker namespace.Name
 )
 
 func TestAuthorizerInterceptorSuite(t *testing.T) {
@@ -78,17 +79,21 @@ func (s *authorizerInterceptorSuite) SetupTest() {
 	s.Assertions = require.New(s.T())
 	s.controller = gomock.NewController(s.T())
 
-	s.mockFrontendHandler = workflowservicemock.NewMockWorkflowServiceServer(s.controller)
 	s.mockAuthorizer = NewMockAuthorizer(s.controller)
 	s.mockMetricsHandler = metrics.NewMockHandler(s.controller)
-	s.mockMetricsHandler.EXPECT().WithTags(metrics.OperationTag(metrics.AuthorizationScope)).Return(s.mockMetricsHandler).AnyTimes()
+	s.mockMetricsHandler.EXPECT().WithTags(
+		metrics.OperationTag(metrics.AuthorizationScope),
+		metrics.NamespaceTag(testNamespace),
+	).Return(s.mockMetricsHandler).AnyTimes()
 	s.mockMetricsHandler.EXPECT().Timer(metrics.ServiceAuthorizationLatency.Name()).Return(metrics.NoopTimerMetricFunc).AnyTimes()
+
 	s.mockClaimMapper = NewMockClaimMapper(s.controller)
 	s.interceptor = NewInterceptor(
 		s.mockClaimMapper,
 		s.mockAuthorizer,
 		s.mockMetricsHandler,
 		log.NewNoopLogger(),
+		mockNamespaceChecker(testNamespace),
 		nil,
 		"",
 		"",
@@ -128,6 +133,23 @@ func (s *authorizerInterceptorSuite) TestIsUnauthorized() {
 	s.Error(err)
 }
 
+func (s *authorizerInterceptorSuite) TestIsUnknown() {
+	request := &workflowservice.DescribeNamespaceRequest{Namespace: "unknown-namespace"}
+	target := &CallTarget{Namespace: "unknown-namespace", Request: request, APIName: "/temporal.api.workflowservice.v1.WorkflowService/DescribeNamespace"}
+	s.mockAuthorizer.EXPECT().Authorize(ctx, nil, target).Return(Result{Decision: DecisionDeny}, nil)
+	handler := metrics.NewMockHandler(s.controller)
+	s.mockMetricsHandler.EXPECT().WithTags(
+		metrics.OperationTag(metrics.AuthorizationScope),
+		metrics.NamespaceUnknownTag(), // note: should use unknown tag since unknown-namespace is not registered
+	).Return(handler).AnyTimes()
+	handler.EXPECT().Counter(metrics.ServiceErrUnauthorizedCounter.Name()).Return(metrics.NoopCounterMetricFunc)
+	handler.EXPECT().Timer(metrics.ServiceAuthorizationLatency.Name()).Return(metrics.NoopTimerMetricFunc)
+
+	res, err := s.interceptor.Intercept(ctx, request, describeNamespaceInfo, s.handler)
+	s.Nil(res)
+	s.Error(err)
+}
+
 func (s *authorizerInterceptorSuite) TestAuthorizationFailed() {
 	s.mockAuthorizer.EXPECT().Authorize(ctx, nil, describeNamespaceTarget).
 		Return(Result{Decision: DecisionDeny}, errUnauthorized)
@@ -153,6 +175,7 @@ func (s *authorizerInterceptorSuite) TestNoopClaimMapperWithoutTLS() {
 		s.mockAuthorizer,
 		s.mockMetricsHandler,
 		log.NewNoopLogger(),
+		mockNamespaceChecker(testNamespace),
 		nil,
 		"",
 		"",
@@ -167,6 +190,7 @@ func (s *authorizerInterceptorSuite) TestAlternateHeaders() {
 		NewNoopAuthorizer(),
 		s.mockMetricsHandler,
 		log.NewNoopLogger(),
+		mockNamespaceChecker(testNamespace),
 		nil,
 		"custom-header",
 		"custom-extra-header",
@@ -210,4 +234,11 @@ func (s *authorizerInterceptorSuite) TestAlternateHeaders() {
 		_, err := interceptor.Intercept(inCtx, describeNamespaceRequest, describeNamespaceInfo, s.handler)
 		s.NoError(err)
 	}
+}
+
+func (n mockNamespaceChecker) Exists(name namespace.Name) error {
+	if name == namespace.Name(n) {
+		return nil
+	}
+	return errors.New("doesn't exist")
 }

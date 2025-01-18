@@ -94,7 +94,15 @@ func (mdb *db) InsertIntoVisibility(
 	row *sqlplugin.VisibilityRow,
 ) (result sql.Result, retError error) {
 	finalRow := mdb.prepareRowForDB(row)
-	tx, err := mdb.db.BeginTxx(ctx, nil)
+	defer func() {
+		retError = mdb.handle.ConvertError(retError)
+	}()
+	db, err := mdb.handle.DB()
+	if err != nil {
+		return nil, err
+	}
+
+	tx, err := db.BeginTxx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -108,11 +116,11 @@ func (mdb *db) InsertIntoVisibility(
 	}()
 	result, err = tx.NamedExecContext(ctx, templateInsertWorkflowExecution, finalRow)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to insert workflow execution: %w", err)
 	}
 	_, err = tx.NamedExecContext(ctx, templateInsertCustomSearchAttributes, finalRow)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to insert custom search attributes: %w", err)
 	}
 	err = tx.Commit()
 	if err != nil {
@@ -126,8 +134,15 @@ func (mdb *db) ReplaceIntoVisibility(
 	ctx context.Context,
 	row *sqlplugin.VisibilityRow,
 ) (result sql.Result, retError error) {
+	defer func() {
+		retError = mdb.handle.ConvertError(retError)
+	}()
 	finalRow := mdb.prepareRowForDB(row)
-	tx, err := mdb.db.BeginTxx(ctx, nil)
+	db, err := mdb.handle.DB()
+	if err != nil {
+		return nil, err
+	}
+	tx, err := db.BeginTxx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -141,11 +156,11 @@ func (mdb *db) ReplaceIntoVisibility(
 	}()
 	result, err = tx.NamedExecContext(ctx, templateUpsertWorkflowExecution, finalRow)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to upsert workflow execution: %w", err)
 	}
 	_, err = tx.NamedExecContext(ctx, templateUpsertCustomSearchAttributes, finalRow)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to upsert custom search attributes: %w", err)
 	}
 	err = tx.Commit()
 	if err != nil {
@@ -159,7 +174,15 @@ func (mdb *db) DeleteFromVisibility(
 	ctx context.Context,
 	filter sqlplugin.VisibilityDeleteFilter,
 ) (result sql.Result, retError error) {
-	tx, err := mdb.db.BeginTxx(ctx, nil)
+	defer func() {
+		retError = mdb.handle.ConvertError(retError)
+	}()
+	db, err := mdb.handle.DB()
+	if err != nil {
+		return nil, err
+	}
+
+	tx, err := db.BeginTxx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -171,13 +194,13 @@ func (mdb *db) DeleteFromVisibility(
 			retError = fmt.Errorf("transaction rollback failed: %w", retError)
 		}
 	}()
-	_, err = mdb.conn.NamedExecContext(ctx, templateDeleteCustomSearchAttributes, filter)
+	_, err = mdb.NamedExecContext(ctx, templateDeleteCustomSearchAttributes, filter)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to delete custom search attributes: %w", err)
 	}
-	result, err = mdb.conn.NamedExecContext(ctx, templateDeleteWorkflowExecution_v8, filter)
+	result, err = mdb.NamedExecContext(ctx, templateDeleteWorkflowExecution_v8, filter)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to delete workflow execution: %w", err)
 	}
 	err = tx.Commit()
 	if err != nil {
@@ -200,7 +223,7 @@ func (mdb *db) SelectFromVisibility(
 	}
 
 	var rows []sqlplugin.VisibilityRow
-	err := mdb.conn.SelectContext(ctx, &rows, filter.Query, filter.QueryArgs...)
+	err := mdb.SelectContext(ctx, &rows, filter.Query, filter.QueryArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -219,7 +242,7 @@ func (mdb *db) GetFromVisibility(
 	filter sqlplugin.VisibilityGetFilter,
 ) (*sqlplugin.VisibilityRow, error) {
 	var row sqlplugin.VisibilityRow
-	stmt, err := mdb.conn.PrepareNamedContext(ctx, templateGetWorkflowExecution_v8)
+	stmt, err := mdb.PrepareNamedContext(ctx, templateGetWorkflowExecution_v8)
 	if err != nil {
 		return nil, err
 	}
@@ -239,7 +262,7 @@ func (mdb *db) CountFromVisibility(
 	filter sqlplugin.VisibilitySelectFilter,
 ) (int64, error) {
 	var count int64
-	err := mdb.conn.GetContext(ctx, &count, filter.Query, filter.QueryArgs...)
+	err := mdb.GetContext(ctx, &count, filter.Query, filter.QueryArgs...)
 	if err != nil {
 		return 0, err
 	}
@@ -249,8 +272,15 @@ func (mdb *db) CountFromVisibility(
 func (mdb *db) CountGroupByFromVisibility(
 	ctx context.Context,
 	filter sqlplugin.VisibilitySelectFilter,
-) ([]sqlplugin.VisibilityCountRow, error) {
-	rows, err := mdb.db.QueryContext(ctx, filter.Query, filter.QueryArgs...)
+) (_ []sqlplugin.VisibilityCountRow, retError error) {
+	defer func() {
+		retError = mdb.handle.ConvertError(retError)
+	}()
+	db, err := mdb.handle.DB()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := db.QueryContext(ctx, filter.Query, filter.QueryArgs...)
 	if err != nil {
 		return nil, err
 	}

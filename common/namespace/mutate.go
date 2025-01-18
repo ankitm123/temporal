@@ -26,9 +26,8 @@ package namespace
 
 import (
 	namespacepb "go.temporal.io/api/namespace/v1"
-	"google.golang.org/protobuf/types/known/durationpb"
-
 	"go.temporal.io/server/common/persistence"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 type mutationFunc func(*persistence.GetNamespaceResponse)
@@ -75,7 +74,7 @@ func WithGlobalFlag(b bool) Mutation {
 		})
 }
 
-// WithRentention assigns the retention duration to a Namespace during a Clone
+// WithRetention assigns the retention duration to a Namespace during a Clone
 // operation.
 func WithRetention(dur *durationpb.Duration) Mutation {
 	return mutationFunc(
