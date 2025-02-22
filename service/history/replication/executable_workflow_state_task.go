@@ -26,10 +26,10 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"go.temporal.io/api/serviceerror"
-
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	"go.temporal.io/server/api/historyservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
@@ -41,6 +41,7 @@ import (
 	"go.temporal.io/server/common/namespace"
 	serviceerrors "go.temporal.io/server/common/serviceerror"
 	ctasks "go.temporal.io/server/common/tasks"
+	"go.temporal.io/server/service/history/consts"
 )
 
 type (
@@ -64,6 +65,9 @@ func NewExecutableWorkflowStateTask(
 	taskCreationTime time.Time,
 	task *replicationspb.SyncWorkflowStateTaskAttributes,
 	sourceClusterName string,
+	sourceShardKey ClusterShardKey,
+	priority enumsspb.TaskPriority,
+	replicationTask *replicationspb.ReplicationTask,
 ) *ExecutableWorkflowStateTask {
 	namespaceID := task.GetWorkflowState().ExecutionInfo.NamespaceId
 	workflowID := task.GetWorkflowState().ExecutionInfo.WorkflowId
@@ -79,6 +83,9 @@ func NewExecutableWorkflowStateTask(
 			taskCreationTime,
 			time.Now().UTC(),
 			sourceClusterName,
+			sourceShardKey,
+			priority,
+			replicationTask,
 		),
 		req: &historyservice.ReplicateWorkflowStateRequest{
 			NamespaceId:   namespaceID,
@@ -117,7 +124,7 @@ func (e *ExecutableWorkflowStateTask) Execute() error {
 		)
 		return nil
 	}
-	ctx, cancel := newTaskContext(namespaceName)
+	ctx, cancel := newTaskContext(namespaceName, e.Config.ReplicationTaskApplyTimeout())
 	defer cancel()
 
 	shardContext, err := e.ShardController.GetShardByNamespaceWorkflow(
@@ -135,6 +142,10 @@ func (e *ExecutableWorkflowStateTask) Execute() error {
 }
 
 func (e *ExecutableWorkflowStateTask) HandleErr(err error) error {
+	if errors.Is(err, consts.ErrDuplicate) {
+		e.MarkTaskDuplicated()
+		return nil
+	}
 	switch retryErr := err.(type) {
 	case nil, *serviceerror.NotFound:
 		return nil
@@ -146,7 +157,7 @@ func (e *ExecutableWorkflowStateTask) HandleErr(err error) error {
 		if nsError != nil {
 			return err
 		}
-		ctx, cancel := newTaskContext(namespaceName)
+		ctx, cancel := newTaskContext(namespaceName, e.Config.ReplicationTaskApplyTimeout())
 		defer cancel()
 
 		if doContinue, resendErr := e.Resend(
@@ -171,33 +182,15 @@ func (e *ExecutableWorkflowStateTask) HandleErr(err error) error {
 }
 
 func (e *ExecutableWorkflowStateTask) MarkPoisonPill() error {
-	shardContext, err := e.ShardController.GetShardByNamespaceWorkflow(
-		namespace.ID(e.NamespaceID),
-		e.WorkflowID,
-	)
-	if err != nil {
-		return err
+	if e.ReplicationTask().GetRawTaskInfo() == nil {
+		e.ReplicationTask().RawTaskInfo = &persistencespb.ReplicationTaskInfo{
+			NamespaceId: e.NamespaceID,
+			WorkflowId:  e.WorkflowID,
+			RunId:       e.RunID,
+			TaskId:      e.ExecutableTask.TaskID(),
+			TaskType:    enumsspb.TASK_TYPE_REPLICATION_SYNC_WORKFLOW_STATE,
+		}
 	}
 
-	// TODO: GetShardID will break GetDLQReplicationMessages we need to handle DLQ for cross shard replication.
-	taskInfo := &persistencespb.ReplicationTaskInfo{
-		NamespaceId: e.NamespaceID,
-		WorkflowId:  e.WorkflowID,
-		RunId:       e.RunID,
-		TaskId:      e.ExecutableTask.TaskID(),
-		TaskType:    enumsspb.TASK_TYPE_REPLICATION_SYNC_WORKFLOW_STATE,
-	}
-
-	e.Logger.Error("enqueue workflow state replication task to DLQ",
-		tag.ShardID(shardContext.GetShardID()),
-		tag.WorkflowNamespaceID(e.NamespaceID),
-		tag.WorkflowID(e.WorkflowID),
-		tag.WorkflowRunID(e.RunID),
-		tag.TaskID(e.ExecutableTask.TaskID()),
-	)
-
-	ctx, cancel := newTaskContext(e.NamespaceID)
-	defer cancel()
-
-	return writeTaskToDLQ(ctx, e.DLQWriter, shardContext, e.SourceClusterName(), taskInfo)
+	return e.ExecutableTask.MarkPoisonPill()
 }

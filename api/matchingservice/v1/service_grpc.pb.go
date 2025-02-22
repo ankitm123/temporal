@@ -54,18 +54,26 @@ const (
 	MatchingService_RespondNexusTaskFailed_FullMethodName                 = "/temporal.server.api.matchingservice.v1.MatchingService/RespondNexusTaskFailed"
 	MatchingService_CancelOutstandingPoll_FullMethodName                  = "/temporal.server.api.matchingservice.v1.MatchingService/CancelOutstandingPoll"
 	MatchingService_DescribeTaskQueue_FullMethodName                      = "/temporal.server.api.matchingservice.v1.MatchingService/DescribeTaskQueue"
+	MatchingService_DescribeTaskQueuePartition_FullMethodName             = "/temporal.server.api.matchingservice.v1.MatchingService/DescribeTaskQueuePartition"
 	MatchingService_ListTaskQueuePartitions_FullMethodName                = "/temporal.server.api.matchingservice.v1.MatchingService/ListTaskQueuePartitions"
 	MatchingService_UpdateWorkerBuildIdCompatibility_FullMethodName       = "/temporal.server.api.matchingservice.v1.MatchingService/UpdateWorkerBuildIdCompatibility"
 	MatchingService_GetWorkerBuildIdCompatibility_FullMethodName          = "/temporal.server.api.matchingservice.v1.MatchingService/GetWorkerBuildIdCompatibility"
 	MatchingService_GetTaskQueueUserData_FullMethodName                   = "/temporal.server.api.matchingservice.v1.MatchingService/GetTaskQueueUserData"
+	MatchingService_UpdateWorkerVersioningRules_FullMethodName            = "/temporal.server.api.matchingservice.v1.MatchingService/UpdateWorkerVersioningRules"
+	MatchingService_GetWorkerVersioningRules_FullMethodName               = "/temporal.server.api.matchingservice.v1.MatchingService/GetWorkerVersioningRules"
+	MatchingService_SyncDeploymentUserData_FullMethodName                 = "/temporal.server.api.matchingservice.v1.MatchingService/SyncDeploymentUserData"
 	MatchingService_ApplyTaskQueueUserDataReplicationEvent_FullMethodName = "/temporal.server.api.matchingservice.v1.MatchingService/ApplyTaskQueueUserDataReplicationEvent"
 	MatchingService_GetBuildIdTaskQueueMapping_FullMethodName             = "/temporal.server.api.matchingservice.v1.MatchingService/GetBuildIdTaskQueueMapping"
+	MatchingService_ForceLoadTaskQueuePartition_FullMethodName            = "/temporal.server.api.matchingservice.v1.MatchingService/ForceLoadTaskQueuePartition"
 	MatchingService_ForceUnloadTaskQueue_FullMethodName                   = "/temporal.server.api.matchingservice.v1.MatchingService/ForceUnloadTaskQueue"
+	MatchingService_ForceUnloadTaskQueuePartition_FullMethodName          = "/temporal.server.api.matchingservice.v1.MatchingService/ForceUnloadTaskQueuePartition"
 	MatchingService_UpdateTaskQueueUserData_FullMethodName                = "/temporal.server.api.matchingservice.v1.MatchingService/UpdateTaskQueueUserData"
 	MatchingService_ReplicateTaskQueueUserData_FullMethodName             = "/temporal.server.api.matchingservice.v1.MatchingService/ReplicateTaskQueueUserData"
-	MatchingService_CreateOrUpdateNexusIncomingService_FullMethodName     = "/temporal.server.api.matchingservice.v1.MatchingService/CreateOrUpdateNexusIncomingService"
-	MatchingService_DeleteNexusIncomingService_FullMethodName             = "/temporal.server.api.matchingservice.v1.MatchingService/DeleteNexusIncomingService"
-	MatchingService_ListNexusIncomingServices_FullMethodName              = "/temporal.server.api.matchingservice.v1.MatchingService/ListNexusIncomingServices"
+	MatchingService_CheckTaskQueueUserDataPropagation_FullMethodName      = "/temporal.server.api.matchingservice.v1.MatchingService/CheckTaskQueueUserDataPropagation"
+	MatchingService_CreateNexusEndpoint_FullMethodName                    = "/temporal.server.api.matchingservice.v1.MatchingService/CreateNexusEndpoint"
+	MatchingService_UpdateNexusEndpoint_FullMethodName                    = "/temporal.server.api.matchingservice.v1.MatchingService/UpdateNexusEndpoint"
+	MatchingService_DeleteNexusEndpoint_FullMethodName                    = "/temporal.server.api.matchingservice.v1.MatchingService/DeleteNexusEndpoint"
+	MatchingService_ListNexusEndpoints_FullMethodName                     = "/temporal.server.api.matchingservice.v1.MatchingService/ListNexusEndpoints"
 )
 
 // MatchingServiceClient is the client API for MatchingService service.
@@ -107,6 +115,8 @@ type MatchingServiceClient interface {
 	// DescribeTaskQueue returns information about the target task queue, right now this API returns the
 	// pollers which polled this task queue in last few minutes.
 	DescribeTaskQueue(ctx context.Context, in *DescribeTaskQueueRequest, opts ...grpc.CallOption) (*DescribeTaskQueueResponse, error)
+	// DescribeTaskQueuePartition returns information about the target task queue partition.
+	DescribeTaskQueuePartition(ctx context.Context, in *DescribeTaskQueuePartitionRequest, opts ...grpc.CallOption) (*DescribeTaskQueuePartitionResponse, error)
 	// ListTaskQueuePartitions returns a map of partitionKey and hostAddress for a task queue.
 	ListTaskQueuePartitions(ctx context.Context, in *ListTaskQueuePartitionsRequest, opts ...grpc.CallOption) (*ListTaskQueuePartitionsResponse, error)
 	// (-- api-linter: core::0134::response-message-name=disabled
@@ -120,12 +130,40 @@ type MatchingServiceClient interface {
 	GetWorkerBuildIdCompatibility(ctx context.Context, in *GetWorkerBuildIdCompatibilityRequest, opts ...grpc.CallOption) (*GetWorkerBuildIdCompatibilityResponse, error)
 	// Fetch user data for a task queue, this request should always be routed to the node holding the root partition of the workflow task queue.
 	GetTaskQueueUserData(ctx context.Context, in *GetTaskQueueUserDataRequest, opts ...grpc.CallOption) (*GetTaskQueueUserDataResponse, error)
+	// Allows updating the Build ID assignment and redirect rules for a given Task Queue.
+	// (-- api-linter: core::0134::method-signature=disabled
+	//
+	//	aip.dev/not-precedent: UpdateWorkerVersioningRulesRequest RPC doesn't follow Google API format. --)
+	//
+	// (-- api-linter: core::0134::response-message-name=disabled
+	//
+	//	aip.dev/not-precedent: UpdateWorkerVersioningRulesRequest RPC doesn't follow Google API format. --)
+	UpdateWorkerVersioningRules(ctx context.Context, in *UpdateWorkerVersioningRulesRequest, opts ...grpc.CallOption) (*UpdateWorkerVersioningRulesResponse, error)
+	// Fetches the Build ID assignment and redirect rules for a Task Queue
+	// (-- api-linter: core::0127::resource-name-extraction=disabled
+	//
+	//	aip.dev/not-precedent: GetWorkerVersioningRulesRequest RPC doesn't follow Google API format. --)
+	//
+	// (-- api-linter: core::0131::http-uri-name=disabled
+	//
+	//	aip.dev/not-precedent: GetWorkerVersioningRulesRequest RPC doesn't follow Google API format. --)
+	GetWorkerVersioningRules(ctx context.Context, in *GetWorkerVersioningRulesRequest, opts ...grpc.CallOption) (*GetWorkerVersioningRulesResponse, error)
+	// This request should always be routed to the node holding the root partition of the workflow task queue.
+	SyncDeploymentUserData(ctx context.Context, in *SyncDeploymentUserDataRequest, opts ...grpc.CallOption) (*SyncDeploymentUserDataResponse, error)
 	// Apply a user data replication event.
 	ApplyTaskQueueUserDataReplicationEvent(ctx context.Context, in *ApplyTaskQueueUserDataReplicationEventRequest, opts ...grpc.CallOption) (*ApplyTaskQueueUserDataReplicationEventResponse, error)
 	// Gets all task queue names mapped to a given build ID
 	GetBuildIdTaskQueueMapping(ctx context.Context, in *GetBuildIdTaskQueueMappingRequest, opts ...grpc.CallOption) (*GetBuildIdTaskQueueMappingResponse, error)
-	// Force unloading a task queue. Used for testing only.
+	// Force loading a task queue partition. Used by matching node owning root partition.
+	// When root partition is loaded this is called for all child partitions.
+	// This addresses the posibility of unloaded child partitions having backlog,
+	// but not being forwarded/synced to the root partition to find the polling
+	// worker which triggered the root partition being loaded in the first place.
+	ForceLoadTaskQueuePartition(ctx context.Context, in *ForceLoadTaskQueuePartitionRequest, opts ...grpc.CallOption) (*ForceLoadTaskQueuePartitionResponse, error)
+	// TODO Shivam - remove this in 123. Present for backwards compatibility.
 	ForceUnloadTaskQueue(ctx context.Context, in *ForceUnloadTaskQueueRequest, opts ...grpc.CallOption) (*ForceUnloadTaskQueueResponse, error)
+	// Force unloading a task queue partition.
+	ForceUnloadTaskQueuePartition(ctx context.Context, in *ForceUnloadTaskQueuePartitionRequest, opts ...grpc.CallOption) (*ForceUnloadTaskQueuePartitionResponse, error)
 	// Update task queue user data in owning node for all updates in namespace.
 	// All user data updates must first go through the task queue owner using the `UpdateWorkerBuildIdCompatibility`
 	// API.
@@ -139,30 +177,42 @@ type MatchingServiceClient interface {
 	UpdateTaskQueueUserData(ctx context.Context, in *UpdateTaskQueueUserDataRequest, opts ...grpc.CallOption) (*UpdateTaskQueueUserDataResponse, error)
 	// Replicate task queue user data across clusters, must be done via the owning node for updates in namespace.
 	ReplicateTaskQueueUserData(ctx context.Context, in *ReplicateTaskQueueUserDataRequest, opts ...grpc.CallOption) (*ReplicateTaskQueueUserDataResponse, error)
-	// Optimistically create or update a Nexus incoming service based on provided version.
-	// Set version to 0 to create a new service.
-	// If this request is accepted, the input is considered the "current" state of this service at the time it was
-	// persisted and the updated version is returned.
+	// Blocks on user data propagation to all loaded partitions. If successful, all loaded
+	// workflow + activity partitions have the requested version or higher.
+	// Routed to user data owner (root partition of workflow task queue).
+	CheckTaskQueueUserDataPropagation(ctx context.Context, in *CheckTaskQueueUserDataPropagationRequest, opts ...grpc.CallOption) (*CheckTaskQueueUserDataPropagationResponse, error)
+	// Create a Nexus endpoint.
+	// (-- api-linter: core::0133::method-signature=disabled
+	//
+	//	aip.dev/not-precedent: CreateNexusEndpoint RPC doesn't follow Google API format. --)
+	//
 	// (-- api-linter: core::0133::response-message-name=disabled
 	//
-	//	aip.dev/not-precedent: CreateOrUpdateNexusIncomingService RPC doesn't follow Google API format. --)
+	//	aip.dev/not-precedent: CreateNexusEndpoint RPC doesn't follow Google API format. --)
 	//
 	// (-- api-linter: core::0133::http-uri-parent=disabled
 	//
-	//	aip.dev/not-precedent: CreateOrUpdateNexusIncomingService RPC doesn't follow Google API format. --)
+	//	aip.dev/not-precedent: CreateNexusEndpoint RPC doesn't follow Google API format. --)
+	CreateNexusEndpoint(ctx context.Context, in *CreateNexusEndpointRequest, opts ...grpc.CallOption) (*CreateNexusEndpointResponse, error)
+	// Optimistically update a Nexus endpoint based on provided version.
+	// If this request is accepted, the input is considered the "current" state of this service at the time it was
+	// persisted and the updated version is returned.
+	// (-- api-linter: core::0134::method-signature=disabled
 	//
-	// (-- api-linter: core::0133::method-signature=disabled
+	//	aip.dev/not-precedent: UpdateNexusEndpoint RPC doesn't follow Google API format. --)
 	//
-	//	aip.dev/not-precedent: CreateOrUpdateNexusIncomingService RPC doesn't follow Google API format. --)
+	// (-- api-linter: core::0134::response-message-name=disabled
 	//
-	// (-- api-linter: core::0133::request-resource-field=disabled
+	//	aip.dev/not-precedent: UpdateNexusEndpoint RPC doesn't follow Google API format. --)
 	//
-	//	aip.dev/not-precedent: CreateOrUpdateNexusIncomingService RPC doesn't follow Google API format. --)
-	CreateOrUpdateNexusIncomingService(ctx context.Context, in *CreateOrUpdateNexusIncomingServiceRequest, opts ...grpc.CallOption) (*CreateOrUpdateNexusIncomingServiceResponse, error)
+	// (-- api-linter: core::0134::request-resource-required=disabled
+	//
+	//	aip.dev/not-precedent: UpdateNexusEndpoint RPC doesn't follow Google API format. --)
+	UpdateNexusEndpoint(ctx context.Context, in *UpdateNexusEndpointRequest, opts ...grpc.CallOption) (*UpdateNexusEndpointResponse, error)
 	// Delete a service by its name.
-	DeleteNexusIncomingService(ctx context.Context, in *DeleteNexusIncomingServiceRequest, opts ...grpc.CallOption) (*DeleteNexusIncomingServiceResponse, error)
+	DeleteNexusEndpoint(ctx context.Context, in *DeleteNexusEndpointRequest, opts ...grpc.CallOption) (*DeleteNexusEndpointResponse, error)
 	// List all registered services.
-	ListNexusIncomingServices(ctx context.Context, in *ListNexusIncomingServicesRequest, opts ...grpc.CallOption) (*ListNexusIncomingServicesResponse, error)
+	ListNexusEndpoints(ctx context.Context, in *ListNexusEndpointsRequest, opts ...grpc.CallOption) (*ListNexusEndpointsResponse, error)
 }
 
 type matchingServiceClient struct {
@@ -281,6 +331,15 @@ func (c *matchingServiceClient) DescribeTaskQueue(ctx context.Context, in *Descr
 	return out, nil
 }
 
+func (c *matchingServiceClient) DescribeTaskQueuePartition(ctx context.Context, in *DescribeTaskQueuePartitionRequest, opts ...grpc.CallOption) (*DescribeTaskQueuePartitionResponse, error) {
+	out := new(DescribeTaskQueuePartitionResponse)
+	err := c.cc.Invoke(ctx, MatchingService_DescribeTaskQueuePartition_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *matchingServiceClient) ListTaskQueuePartitions(ctx context.Context, in *ListTaskQueuePartitionsRequest, opts ...grpc.CallOption) (*ListTaskQueuePartitionsResponse, error) {
 	out := new(ListTaskQueuePartitionsResponse)
 	err := c.cc.Invoke(ctx, MatchingService_ListTaskQueuePartitions_FullMethodName, in, out, opts...)
@@ -317,6 +376,33 @@ func (c *matchingServiceClient) GetTaskQueueUserData(ctx context.Context, in *Ge
 	return out, nil
 }
 
+func (c *matchingServiceClient) UpdateWorkerVersioningRules(ctx context.Context, in *UpdateWorkerVersioningRulesRequest, opts ...grpc.CallOption) (*UpdateWorkerVersioningRulesResponse, error) {
+	out := new(UpdateWorkerVersioningRulesResponse)
+	err := c.cc.Invoke(ctx, MatchingService_UpdateWorkerVersioningRules_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *matchingServiceClient) GetWorkerVersioningRules(ctx context.Context, in *GetWorkerVersioningRulesRequest, opts ...grpc.CallOption) (*GetWorkerVersioningRulesResponse, error) {
+	out := new(GetWorkerVersioningRulesResponse)
+	err := c.cc.Invoke(ctx, MatchingService_GetWorkerVersioningRules_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *matchingServiceClient) SyncDeploymentUserData(ctx context.Context, in *SyncDeploymentUserDataRequest, opts ...grpc.CallOption) (*SyncDeploymentUserDataResponse, error) {
+	out := new(SyncDeploymentUserDataResponse)
+	err := c.cc.Invoke(ctx, MatchingService_SyncDeploymentUserData_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *matchingServiceClient) ApplyTaskQueueUserDataReplicationEvent(ctx context.Context, in *ApplyTaskQueueUserDataReplicationEventRequest, opts ...grpc.CallOption) (*ApplyTaskQueueUserDataReplicationEventResponse, error) {
 	out := new(ApplyTaskQueueUserDataReplicationEventResponse)
 	err := c.cc.Invoke(ctx, MatchingService_ApplyTaskQueueUserDataReplicationEvent_FullMethodName, in, out, opts...)
@@ -335,9 +421,27 @@ func (c *matchingServiceClient) GetBuildIdTaskQueueMapping(ctx context.Context, 
 	return out, nil
 }
 
+func (c *matchingServiceClient) ForceLoadTaskQueuePartition(ctx context.Context, in *ForceLoadTaskQueuePartitionRequest, opts ...grpc.CallOption) (*ForceLoadTaskQueuePartitionResponse, error) {
+	out := new(ForceLoadTaskQueuePartitionResponse)
+	err := c.cc.Invoke(ctx, MatchingService_ForceLoadTaskQueuePartition_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *matchingServiceClient) ForceUnloadTaskQueue(ctx context.Context, in *ForceUnloadTaskQueueRequest, opts ...grpc.CallOption) (*ForceUnloadTaskQueueResponse, error) {
 	out := new(ForceUnloadTaskQueueResponse)
 	err := c.cc.Invoke(ctx, MatchingService_ForceUnloadTaskQueue_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *matchingServiceClient) ForceUnloadTaskQueuePartition(ctx context.Context, in *ForceUnloadTaskQueuePartitionRequest, opts ...grpc.CallOption) (*ForceUnloadTaskQueuePartitionResponse, error) {
+	out := new(ForceUnloadTaskQueuePartitionResponse)
+	err := c.cc.Invoke(ctx, MatchingService_ForceUnloadTaskQueuePartition_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -362,27 +466,45 @@ func (c *matchingServiceClient) ReplicateTaskQueueUserData(ctx context.Context, 
 	return out, nil
 }
 
-func (c *matchingServiceClient) CreateOrUpdateNexusIncomingService(ctx context.Context, in *CreateOrUpdateNexusIncomingServiceRequest, opts ...grpc.CallOption) (*CreateOrUpdateNexusIncomingServiceResponse, error) {
-	out := new(CreateOrUpdateNexusIncomingServiceResponse)
-	err := c.cc.Invoke(ctx, MatchingService_CreateOrUpdateNexusIncomingService_FullMethodName, in, out, opts...)
+func (c *matchingServiceClient) CheckTaskQueueUserDataPropagation(ctx context.Context, in *CheckTaskQueueUserDataPropagationRequest, opts ...grpc.CallOption) (*CheckTaskQueueUserDataPropagationResponse, error) {
+	out := new(CheckTaskQueueUserDataPropagationResponse)
+	err := c.cc.Invoke(ctx, MatchingService_CheckTaskQueueUserDataPropagation_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *matchingServiceClient) DeleteNexusIncomingService(ctx context.Context, in *DeleteNexusIncomingServiceRequest, opts ...grpc.CallOption) (*DeleteNexusIncomingServiceResponse, error) {
-	out := new(DeleteNexusIncomingServiceResponse)
-	err := c.cc.Invoke(ctx, MatchingService_DeleteNexusIncomingService_FullMethodName, in, out, opts...)
+func (c *matchingServiceClient) CreateNexusEndpoint(ctx context.Context, in *CreateNexusEndpointRequest, opts ...grpc.CallOption) (*CreateNexusEndpointResponse, error) {
+	out := new(CreateNexusEndpointResponse)
+	err := c.cc.Invoke(ctx, MatchingService_CreateNexusEndpoint_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *matchingServiceClient) ListNexusIncomingServices(ctx context.Context, in *ListNexusIncomingServicesRequest, opts ...grpc.CallOption) (*ListNexusIncomingServicesResponse, error) {
-	out := new(ListNexusIncomingServicesResponse)
-	err := c.cc.Invoke(ctx, MatchingService_ListNexusIncomingServices_FullMethodName, in, out, opts...)
+func (c *matchingServiceClient) UpdateNexusEndpoint(ctx context.Context, in *UpdateNexusEndpointRequest, opts ...grpc.CallOption) (*UpdateNexusEndpointResponse, error) {
+	out := new(UpdateNexusEndpointResponse)
+	err := c.cc.Invoke(ctx, MatchingService_UpdateNexusEndpoint_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *matchingServiceClient) DeleteNexusEndpoint(ctx context.Context, in *DeleteNexusEndpointRequest, opts ...grpc.CallOption) (*DeleteNexusEndpointResponse, error) {
+	out := new(DeleteNexusEndpointResponse)
+	err := c.cc.Invoke(ctx, MatchingService_DeleteNexusEndpoint_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *matchingServiceClient) ListNexusEndpoints(ctx context.Context, in *ListNexusEndpointsRequest, opts ...grpc.CallOption) (*ListNexusEndpointsResponse, error) {
+	out := new(ListNexusEndpointsResponse)
+	err := c.cc.Invoke(ctx, MatchingService_ListNexusEndpoints_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -428,6 +550,8 @@ type MatchingServiceServer interface {
 	// DescribeTaskQueue returns information about the target task queue, right now this API returns the
 	// pollers which polled this task queue in last few minutes.
 	DescribeTaskQueue(context.Context, *DescribeTaskQueueRequest) (*DescribeTaskQueueResponse, error)
+	// DescribeTaskQueuePartition returns information about the target task queue partition.
+	DescribeTaskQueuePartition(context.Context, *DescribeTaskQueuePartitionRequest) (*DescribeTaskQueuePartitionResponse, error)
 	// ListTaskQueuePartitions returns a map of partitionKey and hostAddress for a task queue.
 	ListTaskQueuePartitions(context.Context, *ListTaskQueuePartitionsRequest) (*ListTaskQueuePartitionsResponse, error)
 	// (-- api-linter: core::0134::response-message-name=disabled
@@ -441,12 +565,40 @@ type MatchingServiceServer interface {
 	GetWorkerBuildIdCompatibility(context.Context, *GetWorkerBuildIdCompatibilityRequest) (*GetWorkerBuildIdCompatibilityResponse, error)
 	// Fetch user data for a task queue, this request should always be routed to the node holding the root partition of the workflow task queue.
 	GetTaskQueueUserData(context.Context, *GetTaskQueueUserDataRequest) (*GetTaskQueueUserDataResponse, error)
+	// Allows updating the Build ID assignment and redirect rules for a given Task Queue.
+	// (-- api-linter: core::0134::method-signature=disabled
+	//
+	//	aip.dev/not-precedent: UpdateWorkerVersioningRulesRequest RPC doesn't follow Google API format. --)
+	//
+	// (-- api-linter: core::0134::response-message-name=disabled
+	//
+	//	aip.dev/not-precedent: UpdateWorkerVersioningRulesRequest RPC doesn't follow Google API format. --)
+	UpdateWorkerVersioningRules(context.Context, *UpdateWorkerVersioningRulesRequest) (*UpdateWorkerVersioningRulesResponse, error)
+	// Fetches the Build ID assignment and redirect rules for a Task Queue
+	// (-- api-linter: core::0127::resource-name-extraction=disabled
+	//
+	//	aip.dev/not-precedent: GetWorkerVersioningRulesRequest RPC doesn't follow Google API format. --)
+	//
+	// (-- api-linter: core::0131::http-uri-name=disabled
+	//
+	//	aip.dev/not-precedent: GetWorkerVersioningRulesRequest RPC doesn't follow Google API format. --)
+	GetWorkerVersioningRules(context.Context, *GetWorkerVersioningRulesRequest) (*GetWorkerVersioningRulesResponse, error)
+	// This request should always be routed to the node holding the root partition of the workflow task queue.
+	SyncDeploymentUserData(context.Context, *SyncDeploymentUserDataRequest) (*SyncDeploymentUserDataResponse, error)
 	// Apply a user data replication event.
 	ApplyTaskQueueUserDataReplicationEvent(context.Context, *ApplyTaskQueueUserDataReplicationEventRequest) (*ApplyTaskQueueUserDataReplicationEventResponse, error)
 	// Gets all task queue names mapped to a given build ID
 	GetBuildIdTaskQueueMapping(context.Context, *GetBuildIdTaskQueueMappingRequest) (*GetBuildIdTaskQueueMappingResponse, error)
-	// Force unloading a task queue. Used for testing only.
+	// Force loading a task queue partition. Used by matching node owning root partition.
+	// When root partition is loaded this is called for all child partitions.
+	// This addresses the posibility of unloaded child partitions having backlog,
+	// but not being forwarded/synced to the root partition to find the polling
+	// worker which triggered the root partition being loaded in the first place.
+	ForceLoadTaskQueuePartition(context.Context, *ForceLoadTaskQueuePartitionRequest) (*ForceLoadTaskQueuePartitionResponse, error)
+	// TODO Shivam - remove this in 123. Present for backwards compatibility.
 	ForceUnloadTaskQueue(context.Context, *ForceUnloadTaskQueueRequest) (*ForceUnloadTaskQueueResponse, error)
+	// Force unloading a task queue partition.
+	ForceUnloadTaskQueuePartition(context.Context, *ForceUnloadTaskQueuePartitionRequest) (*ForceUnloadTaskQueuePartitionResponse, error)
 	// Update task queue user data in owning node for all updates in namespace.
 	// All user data updates must first go through the task queue owner using the `UpdateWorkerBuildIdCompatibility`
 	// API.
@@ -460,30 +612,42 @@ type MatchingServiceServer interface {
 	UpdateTaskQueueUserData(context.Context, *UpdateTaskQueueUserDataRequest) (*UpdateTaskQueueUserDataResponse, error)
 	// Replicate task queue user data across clusters, must be done via the owning node for updates in namespace.
 	ReplicateTaskQueueUserData(context.Context, *ReplicateTaskQueueUserDataRequest) (*ReplicateTaskQueueUserDataResponse, error)
-	// Optimistically create or update a Nexus incoming service based on provided version.
-	// Set version to 0 to create a new service.
-	// If this request is accepted, the input is considered the "current" state of this service at the time it was
-	// persisted and the updated version is returned.
+	// Blocks on user data propagation to all loaded partitions. If successful, all loaded
+	// workflow + activity partitions have the requested version or higher.
+	// Routed to user data owner (root partition of workflow task queue).
+	CheckTaskQueueUserDataPropagation(context.Context, *CheckTaskQueueUserDataPropagationRequest) (*CheckTaskQueueUserDataPropagationResponse, error)
+	// Create a Nexus endpoint.
+	// (-- api-linter: core::0133::method-signature=disabled
+	//
+	//	aip.dev/not-precedent: CreateNexusEndpoint RPC doesn't follow Google API format. --)
+	//
 	// (-- api-linter: core::0133::response-message-name=disabled
 	//
-	//	aip.dev/not-precedent: CreateOrUpdateNexusIncomingService RPC doesn't follow Google API format. --)
+	//	aip.dev/not-precedent: CreateNexusEndpoint RPC doesn't follow Google API format. --)
 	//
 	// (-- api-linter: core::0133::http-uri-parent=disabled
 	//
-	//	aip.dev/not-precedent: CreateOrUpdateNexusIncomingService RPC doesn't follow Google API format. --)
+	//	aip.dev/not-precedent: CreateNexusEndpoint RPC doesn't follow Google API format. --)
+	CreateNexusEndpoint(context.Context, *CreateNexusEndpointRequest) (*CreateNexusEndpointResponse, error)
+	// Optimistically update a Nexus endpoint based on provided version.
+	// If this request is accepted, the input is considered the "current" state of this service at the time it was
+	// persisted and the updated version is returned.
+	// (-- api-linter: core::0134::method-signature=disabled
 	//
-	// (-- api-linter: core::0133::method-signature=disabled
+	//	aip.dev/not-precedent: UpdateNexusEndpoint RPC doesn't follow Google API format. --)
 	//
-	//	aip.dev/not-precedent: CreateOrUpdateNexusIncomingService RPC doesn't follow Google API format. --)
+	// (-- api-linter: core::0134::response-message-name=disabled
 	//
-	// (-- api-linter: core::0133::request-resource-field=disabled
+	//	aip.dev/not-precedent: UpdateNexusEndpoint RPC doesn't follow Google API format. --)
 	//
-	//	aip.dev/not-precedent: CreateOrUpdateNexusIncomingService RPC doesn't follow Google API format. --)
-	CreateOrUpdateNexusIncomingService(context.Context, *CreateOrUpdateNexusIncomingServiceRequest) (*CreateOrUpdateNexusIncomingServiceResponse, error)
+	// (-- api-linter: core::0134::request-resource-required=disabled
+	//
+	//	aip.dev/not-precedent: UpdateNexusEndpoint RPC doesn't follow Google API format. --)
+	UpdateNexusEndpoint(context.Context, *UpdateNexusEndpointRequest) (*UpdateNexusEndpointResponse, error)
 	// Delete a service by its name.
-	DeleteNexusIncomingService(context.Context, *DeleteNexusIncomingServiceRequest) (*DeleteNexusIncomingServiceResponse, error)
+	DeleteNexusEndpoint(context.Context, *DeleteNexusEndpointRequest) (*DeleteNexusEndpointResponse, error)
 	// List all registered services.
-	ListNexusIncomingServices(context.Context, *ListNexusIncomingServicesRequest) (*ListNexusIncomingServicesResponse, error)
+	ListNexusEndpoints(context.Context, *ListNexusEndpointsRequest) (*ListNexusEndpointsResponse, error)
 	mustEmbedUnimplementedMatchingServiceServer()
 }
 
@@ -527,6 +691,9 @@ func (UnimplementedMatchingServiceServer) CancelOutstandingPoll(context.Context,
 func (UnimplementedMatchingServiceServer) DescribeTaskQueue(context.Context, *DescribeTaskQueueRequest) (*DescribeTaskQueueResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DescribeTaskQueue not implemented")
 }
+func (UnimplementedMatchingServiceServer) DescribeTaskQueuePartition(context.Context, *DescribeTaskQueuePartitionRequest) (*DescribeTaskQueuePartitionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DescribeTaskQueuePartition not implemented")
+}
 func (UnimplementedMatchingServiceServer) ListTaskQueuePartitions(context.Context, *ListTaskQueuePartitionsRequest) (*ListTaskQueuePartitionsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListTaskQueuePartitions not implemented")
 }
@@ -539,14 +706,29 @@ func (UnimplementedMatchingServiceServer) GetWorkerBuildIdCompatibility(context.
 func (UnimplementedMatchingServiceServer) GetTaskQueueUserData(context.Context, *GetTaskQueueUserDataRequest) (*GetTaskQueueUserDataResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetTaskQueueUserData not implemented")
 }
+func (UnimplementedMatchingServiceServer) UpdateWorkerVersioningRules(context.Context, *UpdateWorkerVersioningRulesRequest) (*UpdateWorkerVersioningRulesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UpdateWorkerVersioningRules not implemented")
+}
+func (UnimplementedMatchingServiceServer) GetWorkerVersioningRules(context.Context, *GetWorkerVersioningRulesRequest) (*GetWorkerVersioningRulesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetWorkerVersioningRules not implemented")
+}
+func (UnimplementedMatchingServiceServer) SyncDeploymentUserData(context.Context, *SyncDeploymentUserDataRequest) (*SyncDeploymentUserDataResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SyncDeploymentUserData not implemented")
+}
 func (UnimplementedMatchingServiceServer) ApplyTaskQueueUserDataReplicationEvent(context.Context, *ApplyTaskQueueUserDataReplicationEventRequest) (*ApplyTaskQueueUserDataReplicationEventResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ApplyTaskQueueUserDataReplicationEvent not implemented")
 }
 func (UnimplementedMatchingServiceServer) GetBuildIdTaskQueueMapping(context.Context, *GetBuildIdTaskQueueMappingRequest) (*GetBuildIdTaskQueueMappingResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetBuildIdTaskQueueMapping not implemented")
 }
+func (UnimplementedMatchingServiceServer) ForceLoadTaskQueuePartition(context.Context, *ForceLoadTaskQueuePartitionRequest) (*ForceLoadTaskQueuePartitionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ForceLoadTaskQueuePartition not implemented")
+}
 func (UnimplementedMatchingServiceServer) ForceUnloadTaskQueue(context.Context, *ForceUnloadTaskQueueRequest) (*ForceUnloadTaskQueueResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ForceUnloadTaskQueue not implemented")
+}
+func (UnimplementedMatchingServiceServer) ForceUnloadTaskQueuePartition(context.Context, *ForceUnloadTaskQueuePartitionRequest) (*ForceUnloadTaskQueuePartitionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ForceUnloadTaskQueuePartition not implemented")
 }
 func (UnimplementedMatchingServiceServer) UpdateTaskQueueUserData(context.Context, *UpdateTaskQueueUserDataRequest) (*UpdateTaskQueueUserDataResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method UpdateTaskQueueUserData not implemented")
@@ -554,14 +736,20 @@ func (UnimplementedMatchingServiceServer) UpdateTaskQueueUserData(context.Contex
 func (UnimplementedMatchingServiceServer) ReplicateTaskQueueUserData(context.Context, *ReplicateTaskQueueUserDataRequest) (*ReplicateTaskQueueUserDataResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReplicateTaskQueueUserData not implemented")
 }
-func (UnimplementedMatchingServiceServer) CreateOrUpdateNexusIncomingService(context.Context, *CreateOrUpdateNexusIncomingServiceRequest) (*CreateOrUpdateNexusIncomingServiceResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method CreateOrUpdateNexusIncomingService not implemented")
+func (UnimplementedMatchingServiceServer) CheckTaskQueueUserDataPropagation(context.Context, *CheckTaskQueueUserDataPropagationRequest) (*CheckTaskQueueUserDataPropagationResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CheckTaskQueueUserDataPropagation not implemented")
 }
-func (UnimplementedMatchingServiceServer) DeleteNexusIncomingService(context.Context, *DeleteNexusIncomingServiceRequest) (*DeleteNexusIncomingServiceResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method DeleteNexusIncomingService not implemented")
+func (UnimplementedMatchingServiceServer) CreateNexusEndpoint(context.Context, *CreateNexusEndpointRequest) (*CreateNexusEndpointResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateNexusEndpoint not implemented")
 }
-func (UnimplementedMatchingServiceServer) ListNexusIncomingServices(context.Context, *ListNexusIncomingServicesRequest) (*ListNexusIncomingServicesResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method ListNexusIncomingServices not implemented")
+func (UnimplementedMatchingServiceServer) UpdateNexusEndpoint(context.Context, *UpdateNexusEndpointRequest) (*UpdateNexusEndpointResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UpdateNexusEndpoint not implemented")
+}
+func (UnimplementedMatchingServiceServer) DeleteNexusEndpoint(context.Context, *DeleteNexusEndpointRequest) (*DeleteNexusEndpointResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeleteNexusEndpoint not implemented")
+}
+func (UnimplementedMatchingServiceServer) ListNexusEndpoints(context.Context, *ListNexusEndpointsRequest) (*ListNexusEndpointsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListNexusEndpoints not implemented")
 }
 func (UnimplementedMatchingServiceServer) mustEmbedUnimplementedMatchingServiceServer() {}
 
@@ -792,6 +980,24 @@ func _MatchingService_DescribeTaskQueue_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MatchingService_DescribeTaskQueuePartition_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DescribeTaskQueuePartitionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MatchingServiceServer).DescribeTaskQueuePartition(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MatchingService_DescribeTaskQueuePartition_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MatchingServiceServer).DescribeTaskQueuePartition(ctx, req.(*DescribeTaskQueuePartitionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MatchingService_ListTaskQueuePartitions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListTaskQueuePartitionsRequest)
 	if err := dec(in); err != nil {
@@ -864,6 +1070,60 @@ func _MatchingService_GetTaskQueueUserData_Handler(srv interface{}, ctx context.
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MatchingService_UpdateWorkerVersioningRules_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateWorkerVersioningRulesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MatchingServiceServer).UpdateWorkerVersioningRules(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MatchingService_UpdateWorkerVersioningRules_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MatchingServiceServer).UpdateWorkerVersioningRules(ctx, req.(*UpdateWorkerVersioningRulesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MatchingService_GetWorkerVersioningRules_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetWorkerVersioningRulesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MatchingServiceServer).GetWorkerVersioningRules(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MatchingService_GetWorkerVersioningRules_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MatchingServiceServer).GetWorkerVersioningRules(ctx, req.(*GetWorkerVersioningRulesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MatchingService_SyncDeploymentUserData_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SyncDeploymentUserDataRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MatchingServiceServer).SyncDeploymentUserData(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MatchingService_SyncDeploymentUserData_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MatchingServiceServer).SyncDeploymentUserData(ctx, req.(*SyncDeploymentUserDataRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MatchingService_ApplyTaskQueueUserDataReplicationEvent_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ApplyTaskQueueUserDataReplicationEventRequest)
 	if err := dec(in); err != nil {
@@ -900,6 +1160,24 @@ func _MatchingService_GetBuildIdTaskQueueMapping_Handler(srv interface{}, ctx co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MatchingService_ForceLoadTaskQueuePartition_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForceLoadTaskQueuePartitionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MatchingServiceServer).ForceLoadTaskQueuePartition(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MatchingService_ForceLoadTaskQueuePartition_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MatchingServiceServer).ForceLoadTaskQueuePartition(ctx, req.(*ForceLoadTaskQueuePartitionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MatchingService_ForceUnloadTaskQueue_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ForceUnloadTaskQueueRequest)
 	if err := dec(in); err != nil {
@@ -914,6 +1192,24 @@ func _MatchingService_ForceUnloadTaskQueue_Handler(srv interface{}, ctx context.
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(MatchingServiceServer).ForceUnloadTaskQueue(ctx, req.(*ForceUnloadTaskQueueRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MatchingService_ForceUnloadTaskQueuePartition_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForceUnloadTaskQueuePartitionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MatchingServiceServer).ForceUnloadTaskQueuePartition(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MatchingService_ForceUnloadTaskQueuePartition_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MatchingServiceServer).ForceUnloadTaskQueuePartition(ctx, req.(*ForceUnloadTaskQueuePartitionRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -954,56 +1250,92 @@ func _MatchingService_ReplicateTaskQueueUserData_Handler(srv interface{}, ctx co
 	return interceptor(ctx, in, info, handler)
 }
 
-func _MatchingService_CreateOrUpdateNexusIncomingService_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CreateOrUpdateNexusIncomingServiceRequest)
+func _MatchingService_CheckTaskQueueUserDataPropagation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckTaskQueueUserDataPropagationRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(MatchingServiceServer).CreateOrUpdateNexusIncomingService(ctx, in)
+		return srv.(MatchingServiceServer).CheckTaskQueueUserDataPropagation(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: MatchingService_CreateOrUpdateNexusIncomingService_FullMethodName,
+		FullMethod: MatchingService_CheckTaskQueueUserDataPropagation_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(MatchingServiceServer).CreateOrUpdateNexusIncomingService(ctx, req.(*CreateOrUpdateNexusIncomingServiceRequest))
+		return srv.(MatchingServiceServer).CheckTaskQueueUserDataPropagation(ctx, req.(*CheckTaskQueueUserDataPropagationRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _MatchingService_DeleteNexusIncomingService_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(DeleteNexusIncomingServiceRequest)
+func _MatchingService_CreateNexusEndpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateNexusEndpointRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(MatchingServiceServer).DeleteNexusIncomingService(ctx, in)
+		return srv.(MatchingServiceServer).CreateNexusEndpoint(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: MatchingService_DeleteNexusIncomingService_FullMethodName,
+		FullMethod: MatchingService_CreateNexusEndpoint_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(MatchingServiceServer).DeleteNexusIncomingService(ctx, req.(*DeleteNexusIncomingServiceRequest))
+		return srv.(MatchingServiceServer).CreateNexusEndpoint(ctx, req.(*CreateNexusEndpointRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _MatchingService_ListNexusIncomingServices_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ListNexusIncomingServicesRequest)
+func _MatchingService_UpdateNexusEndpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateNexusEndpointRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(MatchingServiceServer).ListNexusIncomingServices(ctx, in)
+		return srv.(MatchingServiceServer).UpdateNexusEndpoint(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: MatchingService_ListNexusIncomingServices_FullMethodName,
+		FullMethod: MatchingService_UpdateNexusEndpoint_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(MatchingServiceServer).ListNexusIncomingServices(ctx, req.(*ListNexusIncomingServicesRequest))
+		return srv.(MatchingServiceServer).UpdateNexusEndpoint(ctx, req.(*UpdateNexusEndpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MatchingService_DeleteNexusEndpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteNexusEndpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MatchingServiceServer).DeleteNexusEndpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MatchingService_DeleteNexusEndpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MatchingServiceServer).DeleteNexusEndpoint(ctx, req.(*DeleteNexusEndpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MatchingService_ListNexusEndpoints_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListNexusEndpointsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MatchingServiceServer).ListNexusEndpoints(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MatchingService_ListNexusEndpoints_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MatchingServiceServer).ListNexusEndpoints(ctx, req.(*ListNexusEndpointsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1064,6 +1396,10 @@ var MatchingService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _MatchingService_DescribeTaskQueue_Handler,
 		},
 		{
+			MethodName: "DescribeTaskQueuePartition",
+			Handler:    _MatchingService_DescribeTaskQueuePartition_Handler,
+		},
+		{
 			MethodName: "ListTaskQueuePartitions",
 			Handler:    _MatchingService_ListTaskQueuePartitions_Handler,
 		},
@@ -1080,6 +1416,18 @@ var MatchingService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _MatchingService_GetTaskQueueUserData_Handler,
 		},
 		{
+			MethodName: "UpdateWorkerVersioningRules",
+			Handler:    _MatchingService_UpdateWorkerVersioningRules_Handler,
+		},
+		{
+			MethodName: "GetWorkerVersioningRules",
+			Handler:    _MatchingService_GetWorkerVersioningRules_Handler,
+		},
+		{
+			MethodName: "SyncDeploymentUserData",
+			Handler:    _MatchingService_SyncDeploymentUserData_Handler,
+		},
+		{
 			MethodName: "ApplyTaskQueueUserDataReplicationEvent",
 			Handler:    _MatchingService_ApplyTaskQueueUserDataReplicationEvent_Handler,
 		},
@@ -1088,8 +1436,16 @@ var MatchingService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _MatchingService_GetBuildIdTaskQueueMapping_Handler,
 		},
 		{
+			MethodName: "ForceLoadTaskQueuePartition",
+			Handler:    _MatchingService_ForceLoadTaskQueuePartition_Handler,
+		},
+		{
 			MethodName: "ForceUnloadTaskQueue",
 			Handler:    _MatchingService_ForceUnloadTaskQueue_Handler,
+		},
+		{
+			MethodName: "ForceUnloadTaskQueuePartition",
+			Handler:    _MatchingService_ForceUnloadTaskQueuePartition_Handler,
 		},
 		{
 			MethodName: "UpdateTaskQueueUserData",
@@ -1100,16 +1456,24 @@ var MatchingService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _MatchingService_ReplicateTaskQueueUserData_Handler,
 		},
 		{
-			MethodName: "CreateOrUpdateNexusIncomingService",
-			Handler:    _MatchingService_CreateOrUpdateNexusIncomingService_Handler,
+			MethodName: "CheckTaskQueueUserDataPropagation",
+			Handler:    _MatchingService_CheckTaskQueueUserDataPropagation_Handler,
 		},
 		{
-			MethodName: "DeleteNexusIncomingService",
-			Handler:    _MatchingService_DeleteNexusIncomingService_Handler,
+			MethodName: "CreateNexusEndpoint",
+			Handler:    _MatchingService_CreateNexusEndpoint_Handler,
 		},
 		{
-			MethodName: "ListNexusIncomingServices",
-			Handler:    _MatchingService_ListNexusIncomingServices_Handler,
+			MethodName: "UpdateNexusEndpoint",
+			Handler:    _MatchingService_UpdateNexusEndpoint_Handler,
+		},
+		{
+			MethodName: "DeleteNexusEndpoint",
+			Handler:    _MatchingService_DeleteNexusEndpoint_Handler,
+		},
+		{
+			MethodName: "ListNexusEndpoints",
+			Handler:    _MatchingService_ListNexusEndpoints_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

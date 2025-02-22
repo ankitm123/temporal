@@ -26,8 +26,7 @@ package worker
 
 import (
 	"context"
-
-	"go.uber.org/fx"
+	"os"
 
 	"go.temporal.io/server/api/adminservice/v1"
 	"go.temporal.io/server/client"
@@ -38,10 +37,10 @@ import (
 	"go.temporal.io/server/common/membership"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/namespace/nsreplication"
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/visibility"
 	"go.temporal.io/server/common/persistence/visibility/manager"
-	esclient "go.temporal.io/server/common/persistence/visibility/store/elasticsearch/client"
 	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/resolver"
 	"go.temporal.io/server/common/resource"
@@ -51,9 +50,12 @@ import (
 	"go.temporal.io/server/service/worker/batcher"
 	workercommon "go.temporal.io/server/service/worker/common"
 	"go.temporal.io/server/service/worker/deletenamespace"
+	"go.temporal.io/server/service/worker/deployment"
 	"go.temporal.io/server/service/worker/dlq"
 	"go.temporal.io/server/service/worker/migration"
 	"go.temporal.io/server/service/worker/scheduler"
+	"go.temporal.io/server/service/worker/workerdeployment"
+	"go.uber.org/fx"
 )
 
 var Module = fx.Options(
@@ -63,7 +65,10 @@ var Module = fx.Options(
 	deletenamespace.Module,
 	scheduler.Module,
 	batcher.Module,
+	deployment.Module, // [cleanup-wv-pre-release]
+	workerdeployment.Module,
 	dlq.Module,
+	dynamicconfig.Module,
 	fx.Provide(
 		func(c resource.HistoryClient) dlq.HistoryClient {
 			return c
@@ -86,8 +91,8 @@ var Module = fx.Options(
 			})
 		},
 	),
+	fx.Provide(HostInfoProvider),
 	fx.Provide(VisibilityManagerProvider),
-	fx.Provide(dynamicconfig.NewCollection),
 	fx.Provide(ThrottledLoggerRpsFnProvider),
 	fx.Provide(ConfigProvider),
 	fx.Provide(PersistenceRateLimitingParamsProvider),
@@ -97,8 +102,8 @@ var Module = fx.Options(
 		clusterMetadata cluster.Metadata,
 		metadataManager persistence.MetadataManager,
 		logger log.Logger,
-	) namespace.ReplicationTaskExecutor {
-		return namespace.NewReplicationTaskExecutor(
+	) nsreplication.TaskExecutor {
+		return nsreplication.NewTaskExecutor(
 			clusterMetadata.GetCurrentClusterName(),
 			metadataManager,
 			logger,
@@ -117,6 +122,7 @@ func ThrottledLoggerRpsFnProvider(serviceConfig *Config) resource.ThrottledLogge
 func PersistenceRateLimitingParamsProvider(
 	serviceConfig *Config,
 	persistenceLazyLoadedServiceResolver service.PersistenceLazyLoadedServiceResolver,
+	logger log.SnTaggedLogger,
 ) service.PersistenceRateLimitingParams {
 	return service.NewPersistenceRateLimitingParams(
 		serviceConfig.PersistenceMaxQPS,
@@ -124,11 +130,17 @@ func PersistenceRateLimitingParamsProvider(
 		serviceConfig.PersistenceNamespaceMaxQPS,
 		serviceConfig.PersistenceGlobalNamespaceMaxQPS,
 		serviceConfig.PersistencePerShardNamespaceMaxQPS,
-		serviceConfig.EnablePersistencePriorityRateLimiting,
 		serviceConfig.OperatorRPSRatio,
+		serviceConfig.PersistenceQPSBurstRatio,
 		serviceConfig.PersistenceDynamicRateLimitingParams,
 		persistenceLazyLoadedServiceResolver,
+		logger,
 	)
+}
+
+func HostInfoProvider() (membership.HostInfo, error) {
+	hn, err := os.Hostname()
+	return membership.NewHostInfoFromAddress(hn), err
 }
 
 func ServiceResolverProvider(
@@ -153,23 +165,25 @@ func VisibilityManagerProvider(
 	persistenceConfig *config.Persistence,
 	customVisibilityStoreFactory visibility.VisibilityStoreFactory,
 	serviceConfig *Config,
-	esClient esclient.Client,
 	persistenceServiceResolver resolver.ServiceResolver,
 	searchAttributesMapperProvider searchattribute.MapperProvider,
 	saProvider searchattribute.Provider,
+	namespaceRegistry namespace.Registry,
 ) (manager.VisibilityManager, error) {
 	return visibility.NewManager(
 		*persistenceConfig,
 		persistenceServiceResolver,
 		customVisibilityStoreFactory,
-		esClient,
 		nil, // worker visibility never write
 		saProvider,
 		searchAttributesMapperProvider,
+		namespaceRegistry,
 		serviceConfig.VisibilityPersistenceMaxReadQPS,
 		serviceConfig.VisibilityPersistenceMaxWriteQPS,
 		serviceConfig.OperatorRPSRatio,
+		serviceConfig.VisibilityPersistenceSlowQueryThreshold,
 		serviceConfig.EnableReadFromSecondaryVisibility,
+		serviceConfig.VisibilityEnableShadowReadMode,
 		dynamicconfig.GetStringPropertyFn(visibility.SecondaryVisibilityWritingModeOff), // worker visibility never write
 		serviceConfig.VisibilityDisableOrderByClause,
 		serviceConfig.VisibilityEnableManualPagination,

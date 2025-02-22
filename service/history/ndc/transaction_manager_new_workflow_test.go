@@ -29,18 +29,18 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	historypb "go.temporal.io/api/history/v1"
-
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/persistence"
+	"go.temporal.io/server/service/history/consts"
 	"go.temporal.io/server/service/history/shard"
 	"go.temporal.io/server/service/history/workflow"
 	wcache "go.temporal.io/server/service/history/workflow/cache"
+	"go.uber.org/mock/gomock"
 )
 
 type (
@@ -97,7 +97,7 @@ func (s *transactionMgrForNewWorkflowSuite) TestDispatchForNewWorkflow_Dup() {
 	s.mockTransactionMgr.EXPECT().GetCurrentWorkflowRunID(ctx, namespaceID, workflowID).Return(runID, nil)
 
 	err := s.createMgr.dispatchForNewWorkflow(ctx, newWorkflow)
-	s.NoError(err)
+	s.ErrorIs(err, consts.ErrDuplicate)
 }
 
 func (s *transactionMgrForNewWorkflowSuite) TestDispatchForNewWorkflow_BrandNew() {
@@ -272,6 +272,7 @@ func (s *transactionMgrForNewWorkflowSuite) TestDispatchForNewWorkflow_CreateAsZ
 	targetMutableState.EXPECT().CloseTransactionAsSnapshot(workflow.TransactionPolicyPassive).Return(
 		targetWorkflowSnapshot, targetWorkflowEventsSeq, nil,
 	)
+	targetMutableState.EXPECT().GetReapplyCandidateEvents().Return(nil)
 
 	s.mockTransactionMgr.EXPECT().GetCurrentWorkflowRunID(ctx, namespaceID, workflowID).Return(currentRunID, nil)
 	s.mockTransactionMgr.EXPECT().LoadWorkflow(ctx, namespaceID, workflowID, currentRunID).Return(currentWorkflow, nil)
@@ -290,6 +291,85 @@ func (s *transactionMgrForNewWorkflowSuite) TestDispatchForNewWorkflow_CreateAsZ
 		targetWorkflowEventsSeq,
 	).Return(nil)
 	targetContext.EXPECT().ReapplyEvents(gomock.Any(), s.mockShard, targetWorkflowEventsSeq).Return(nil)
+
+	err := s.createMgr.dispatchForNewWorkflow(ctx, targetWorkflow)
+	s.NoError(err)
+	s.True(targetReleaseCalled)
+	s.True(currentReleaseCalled)
+}
+
+func (s *transactionMgrForNewWorkflowSuite) TestDispatchForNewWorkflow_CreateAsZombie_ReapplyCandidates() {
+	ctx := context.Background()
+
+	namespaceID := namespace.ID("some random namespace ID")
+	workflowID := "some random workflow ID"
+	targetRunID := "some random run ID"
+	currentRunID := "other random runID"
+
+	targetReleaseCalled := false
+	currentReleaseCalled := false
+
+	targetWorkflow := NewMockWorkflow(s.controller)
+	targetContext := workflow.NewMockContext(s.controller)
+	targetMutableState := workflow.NewMockMutableState(s.controller)
+	var targetReleaseFn wcache.ReleaseCacheFunc = func(error) { targetReleaseCalled = true }
+	targetWorkflow.EXPECT().GetContext().Return(targetContext).AnyTimes()
+	targetWorkflow.EXPECT().GetMutableState().Return(targetMutableState).AnyTimes()
+	targetWorkflow.EXPECT().GetReleaseFn().Return(targetReleaseFn).AnyTimes()
+
+	currentWorkflow := NewMockWorkflow(s.controller)
+	var currentReleaseFn wcache.ReleaseCacheFunc = func(error) { currentReleaseCalled = true }
+	currentWorkflow.EXPECT().GetReleaseFn().Return(currentReleaseFn).AnyTimes()
+
+	targetWorkflowSnapshot := &persistence.WorkflowSnapshot{
+		ExecutionInfo: &persistencespb.WorkflowExecutionInfo{
+			NamespaceId: namespaceID.String(),
+			WorkflowId:  workflowID,
+		},
+	}
+	targetWorkflowEventsSeq := []*persistence.WorkflowEvents{}
+
+	targetMutableState.EXPECT().GetExecutionInfo().Return(&persistencespb.WorkflowExecutionInfo{
+		NamespaceId: namespaceID.String(),
+		WorkflowId:  workflowID,
+	}).AnyTimes()
+	targetMutableState.EXPECT().GetExecutionState().Return(&persistencespb.WorkflowExecutionState{
+		RunId: targetRunID,
+	}).AnyTimes()
+	targetMutableState.EXPECT().CloseTransactionAsSnapshot(workflow.TransactionPolicyPassive).Return(
+		targetWorkflowSnapshot, targetWorkflowEventsSeq, nil,
+	)
+
+	eventReapplyCandidates := []*historypb.HistoryEvent{{
+		EventId: common.FirstEventID + rand.Int63(),
+	}}
+	eventsToApply := []*persistence.WorkflowEvents{
+		{
+			NamespaceID: namespaceID.String(),
+			WorkflowID:  workflowID,
+			RunID:       targetRunID,
+			Events:      eventReapplyCandidates,
+		},
+	}
+	targetMutableState.EXPECT().GetReapplyCandidateEvents().Return(eventReapplyCandidates)
+
+	s.mockTransactionMgr.EXPECT().GetCurrentWorkflowRunID(ctx, namespaceID, workflowID).Return(currentRunID, nil)
+	s.mockTransactionMgr.EXPECT().LoadWorkflow(ctx, namespaceID, workflowID, currentRunID).Return(currentWorkflow, nil)
+
+	targetWorkflow.EXPECT().HappensAfter(currentWorkflow).Return(false, nil)
+	targetWorkflow.EXPECT().SuppressBy(currentWorkflow).Return(workflow.TransactionPolicyPassive, nil)
+
+	targetContext.EXPECT().CreateWorkflowExecution(
+		gomock.Any(),
+		s.mockShard,
+		persistence.CreateWorkflowModeBypassCurrent,
+		"",
+		int64(0),
+		targetMutableState,
+		targetWorkflowSnapshot,
+		targetWorkflowEventsSeq,
+	).Return(nil)
+	targetContext.EXPECT().ReapplyEvents(gomock.Any(), s.mockShard, eventsToApply).Return(nil)
 
 	err := s.createMgr.dispatchForNewWorkflow(ctx, targetWorkflow)
 	s.NoError(err)
@@ -341,6 +421,7 @@ func (s *transactionMgrForNewWorkflowSuite) TestDispatchForNewWorkflow_CreateAsZ
 	targetMutableState.EXPECT().CloseTransactionAsSnapshot(workflow.TransactionPolicyPassive).Return(
 		targetWorkflowSnapshot, targetWorkflowEventsSeq, nil,
 	)
+	targetMutableState.EXPECT().GetReapplyCandidateEvents().Return(nil)
 
 	s.mockTransactionMgr.EXPECT().GetCurrentWorkflowRunID(ctx, namespaceID, workflowID).Return(currentRunID, nil)
 	s.mockTransactionMgr.EXPECT().LoadWorkflow(ctx, namespaceID, workflowID, currentRunID).Return(currentWorkflow, nil)

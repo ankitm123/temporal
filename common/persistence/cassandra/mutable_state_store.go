@@ -27,17 +27,16 @@ package cassandra
 import (
 	"context"
 	"fmt"
+	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
-
 	enumsspb "go.temporal.io/server/api/enums/v1"
-	persistencespb "go.temporal.io/server/api/persistence/v1"
-	"go.temporal.io/server/common/log"
 	p "go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/nosql/nosqlplugin/cassandra/gocql"
 	"go.temporal.io/server/common/persistence/serialization"
+	"go.temporal.io/server/common/primitives/timestamp"
 )
 
 const (
@@ -358,17 +357,12 @@ const (
 type (
 	MutableStateStore struct {
 		Session gocql.Session
-		Logger  log.Logger
 	}
 )
 
-func NewMutableStateStore(
-	session gocql.Session,
-	logger log.Logger,
-) *MutableStateStore {
+func NewMutableStateStore(session gocql.Session) *MutableStateStore {
 	return &MutableStateStore{
 		Session: session,
-		Logger:  logger,
 	}
 }
 
@@ -592,6 +586,7 @@ func (d *MutableStateStore) UpdateWorkflowExecution(
 			namespaceID,
 			workflowID,
 			runID,
+			timestamp.TimeValuePtr(updateWorkflow.ExecutionState.StartTime),
 		); err != nil {
 			return err
 		}
@@ -626,6 +621,7 @@ func (d *MutableStateStore) UpdateWorkflowExecution(
 		} else {
 			lastWriteVersion := updateWorkflow.LastWriteVersion
 
+			// TODO: double encoding execution state? already in updateWorkflow.ExecutionStateBlob
 			executionStateDatablob, err := serialization.WorkflowExecutionStateToBlob(updateWorkflow.ExecutionState)
 			if err != nil {
 				return err
@@ -722,6 +718,11 @@ func (d *MutableStateStore) ConflictResolveWorkflowExecution(
 
 	var currentRunID string
 
+	var startTime *time.Time
+	if currentWorkflow != nil && currentWorkflow.ExecutionState != nil {
+		startTime = timestamp.TimeValuePtr(currentWorkflow.ExecutionState.StartTime)
+	}
+
 	switch request.Mode {
 	case p.ConflictResolveWorkflowModeBypassCurrent:
 		if err := d.assertNotCurrentExecution(
@@ -730,71 +731,43 @@ func (d *MutableStateStore) ConflictResolveWorkflowExecution(
 			namespaceID,
 			workflowID,
 			resetWorkflow.ExecutionState.RunId,
+			startTime,
 		); err != nil {
 			return err
 		}
 
 	case p.ConflictResolveWorkflowModeUpdateCurrent:
 		executionState := resetWorkflow.ExecutionState
+		executionStateBlob := resetWorkflow.ExecutionStateBlob
 		lastWriteVersion := resetWorkflow.LastWriteVersion
 		if newWorkflow != nil {
 			lastWriteVersion = newWorkflow.LastWriteVersion
 			executionState = newWorkflow.ExecutionState
-		}
-		runID := executionState.RunId
-		createRequestID := executionState.CreateRequestId
-		state := executionState.State
-		status := executionState.Status
-
-		executionStateDatablob, err := serialization.WorkflowExecutionStateToBlob(&persistencespb.WorkflowExecutionState{
-			RunId:           runID,
-			CreateRequestId: createRequestID,
-			State:           state,
-			Status:          status,
-		})
-		if err != nil {
-			return serviceerror.NewUnavailable(fmt.Sprintf("ConflictResolveWorkflowExecution operation failed. Error: %v", err))
+			executionStateBlob = newWorkflow.ExecutionStateBlob
 		}
 
 		if currentWorkflow != nil {
 			currentRunID = currentWorkflow.ExecutionState.RunId
-
-			batch.Query(templateUpdateCurrentWorkflowExecutionQuery,
-				runID,
-				executionStateDatablob.Data,
-				executionStateDatablob.EncodingType.String(),
-				lastWriteVersion,
-				state,
-				shardID,
-				rowTypeExecution,
-				namespaceID,
-				workflowID,
-				permanentRunID,
-				defaultVisibilityTimestamp,
-				rowTypeExecutionTaskID,
-				currentRunID,
-			)
-
 		} else {
 			// reset workflow is current
 			currentRunID = resetWorkflow.ExecutionState.RunId
-
-			batch.Query(templateUpdateCurrentWorkflowExecutionQuery,
-				runID,
-				executionStateDatablob.Data,
-				executionStateDatablob.EncodingType.String(),
-				lastWriteVersion,
-				state,
-				shardID,
-				rowTypeExecution,
-				namespaceID,
-				workflowID,
-				permanentRunID,
-				defaultVisibilityTimestamp,
-				rowTypeExecutionTaskID,
-				currentRunID,
-			)
 		}
+
+		batch.Query(templateUpdateCurrentWorkflowExecutionQuery,
+			executionState.RunId,
+			executionStateBlob.Data,
+			executionStateBlob.EncodingType.String(),
+			lastWriteVersion,
+			executionState.State,
+			shardID,
+			rowTypeExecution,
+			namespaceID,
+			workflowID,
+			permanentRunID,
+			defaultVisibilityTimestamp,
+			rowTypeExecutionTaskID,
+			currentRunID,
+		)
 
 	default:
 		return serviceerror.NewInternal(fmt.Sprintf("ConflictResolveWorkflowExecution: unknown mode: %v", request.Mode))
@@ -872,6 +845,7 @@ func (d *MutableStateStore) assertNotCurrentExecution(
 	namespaceID string,
 	workflowID string,
 	runID string,
+	startTime *time.Time,
 ) error {
 
 	if resp, err := d.GetCurrentExecution(ctx, &p.GetCurrentExecutionRequest{
@@ -887,11 +861,12 @@ func (d *MutableStateStore) assertNotCurrentExecution(
 	} else if resp.RunID == runID {
 		return &p.CurrentWorkflowConditionFailedError{
 			Msg:              fmt.Sprintf("Assertion on current record failed. Current run ID is not expected: %v", resp.RunID),
-			RequestID:        "",
+			RequestIDs:       nil,
 			RunID:            "",
 			State:            enumsspb.WORKFLOW_EXECUTION_STATE_UNSPECIFIED,
 			Status:           enumspb.WORKFLOW_EXECUTION_STATUS_UNSPECIFIED,
 			LastWriteVersion: 0,
+			StartTime:        startTime,
 		}
 	}
 

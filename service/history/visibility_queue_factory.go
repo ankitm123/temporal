@@ -25,16 +25,16 @@
 package history
 
 import (
-	"go.uber.org/fx"
-
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence/visibility/manager"
+	"go.temporal.io/server/common/telemetry"
 	"go.temporal.io/server/service/history/queues"
 	"go.temporal.io/server/service/history/shard"
 	"go.temporal.io/server/service/history/tasks"
 	wcache "go.temporal.io/server/service/history/workflow/cache"
+	"go.uber.org/fx"
 )
 
 const (
@@ -65,9 +65,10 @@ func NewVisibilityQueueFactory(
 			HostScheduler: queues.NewScheduler(
 				params.ClusterMetadata.GetCurrentClusterName(),
 				queues.SchedulerOptions{
-					WorkerCount:             params.Config.VisibilityProcessorSchedulerWorkerCount,
-					ActiveNamespaceWeights:  params.Config.VisibilityProcessorSchedulerActiveRoundRobinWeights,
-					StandbyNamespaceWeights: params.Config.VisibilityProcessorSchedulerStandbyRoundRobinWeights,
+					WorkerCount:                    params.Config.VisibilityProcessorSchedulerWorkerCount,
+					ActiveNamespaceWeights:         params.Config.VisibilityProcessorSchedulerActiveRoundRobinWeights,
+					StandbyNamespaceWeights:        params.Config.VisibilityProcessorSchedulerStandbyRoundRobinWeights,
+					InactiveNamespaceDeletionDelay: params.Config.TaskSchedulerInactiveChannelDeletionDelay,
 				},
 				params.NamespaceRegistry,
 				params.Logger,
@@ -81,6 +82,7 @@ func NewVisibilityQueueFactory(
 				),
 				int64(params.Config.VisibilityQueueMaxReaderCount()),
 			),
+			Tracer: params.TracerProvider.Tracer(telemetry.ComponentQueueVisibility),
 		},
 	}
 }
@@ -124,6 +126,7 @@ func (f *visibilityQueueFactory) CreateQueue(
 		f.MetricsHandler,
 		f.Config.VisibilityProcessorEnsureCloseBeforeDelete,
 		f.Config.VisibilityProcessorEnableCloseWorkflowCleanup,
+		f.Config.VisibilityProcessorRelocateAttributesMinBlobSize,
 	)
 	if f.ExecutorWrapper != nil {
 		executor = f.ExecutorWrapper.Wrap(executor)
@@ -139,10 +142,12 @@ func (f *visibilityQueueFactory) CreateQueue(
 		shard.GetClusterMetadata(),
 		logger,
 		metricsHandler,
+		f.Tracer,
 		f.DLQWriter,
 		f.Config.TaskDLQEnabled,
 		f.Config.TaskDLQUnexpectedErrorAttempts,
 		f.Config.TaskDLQInternalErrors,
+		f.Config.TaskDLQErrorPattern,
 	)
 	return queues.NewImmediateQueue(
 		shard,
@@ -154,6 +159,7 @@ func (f *visibilityQueueFactory) CreateQueue(
 				BatchSize:            f.Config.VisibilityTaskBatchSize,
 				MaxPendingTasksCount: f.Config.QueuePendingTaskMaxCount,
 				PollBackoffInterval:  f.Config.VisibilityProcessorPollBackoffInterval,
+				MaxPredicateSize:     f.Config.QueueMaxPredicateSize,
 			},
 			MonitorOptions: queues.MonitorOptions{
 				PendingTasksCriticalCount:   f.Config.QueuePendingTaskCriticalCount,

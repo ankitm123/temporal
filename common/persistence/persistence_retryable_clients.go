@@ -28,7 +28,7 @@ import (
 	"context"
 
 	commonpb "go.temporal.io/api/common/v1"
-
+	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common/backoff"
 )
 
@@ -69,8 +69,8 @@ type (
 		isRetryable backoff.IsRetryable
 	}
 
-	nexusIncomingServiceRetryablePersistenceClient struct {
-		persistence NexusIncomingServiceManager
+	nexusEndpointRetryablePersistenceClient struct {
+		persistence NexusEndpointManager
 		policy      backoff.RetryPolicy
 		isRetryable backoff.IsRetryable
 	}
@@ -82,7 +82,7 @@ var _ TaskManager = (*taskRetryablePersistenceClient)(nil)
 var _ MetadataManager = (*metadataRetryablePersistenceClient)(nil)
 var _ ClusterMetadataManager = (*clusterMetadataRetryablePersistenceClient)(nil)
 var _ Queue = (*queueRetryablePersistenceClient)(nil)
-var _ NexusIncomingServiceManager = (*nexusIncomingServiceRetryablePersistenceClient)(nil)
+var _ NexusEndpointManager = (*nexusEndpointRetryablePersistenceClient)(nil)
 
 // NewShardPersistenceRetryableClient creates a client to manage shards
 func NewShardPersistenceRetryableClient(
@@ -162,13 +162,13 @@ func NewQueuePersistenceRetryableClient(
 	}
 }
 
-// NewNexusIncomingServicePersistenceRetryableClient creates a NexusIncomingServiceManager client to manage nexus services
-func NewNexusIncomingServicePersistenceRetryableClient(
-	persistence NexusIncomingServiceManager,
+// NewNexusEndpointPersistenceRetryableClient creates a NexusEndpointManager client to manage nexus endpoints
+func NewNexusEndpointPersistenceRetryableClient(
+	persistence NexusEndpointManager,
 	policy backoff.RetryPolicy,
 	isRetryable backoff.IsRetryable,
-) NexusIncomingServiceManager {
-	return &nexusIncomingServiceRetryablePersistenceClient{
+) NexusEndpointManager {
+	return &nexusEndpointRetryablePersistenceClient{
 		persistence: persistence,
 		policy:      policy,
 		isRetryable: isRetryable,
@@ -657,17 +657,6 @@ func (p *taskRetryablePersistenceClient) GetTasks(
 
 	err := backoff.ThrottleRetryContext(ctx, op, p.policy, p.isRetryable)
 	return response, err
-}
-
-func (p *taskRetryablePersistenceClient) CompleteTask(
-	ctx context.Context,
-	request *CompleteTaskRequest,
-) error {
-	op := func(ctx context.Context) error {
-		return p.persistence.CompleteTask(ctx, request)
-	}
-
-	return backoff.ThrottleRetryContext(ctx, op, p.policy, p.isRetryable)
 }
 
 func (p *taskRetryablePersistenceClient) CompleteTasksLessThan(
@@ -1222,61 +1211,62 @@ func (p *queueRetryablePersistenceClient) Close() {
 	p.persistence.Close()
 }
 
-func (p *nexusIncomingServiceRetryablePersistenceClient) GetName() string {
+func (p *nexusEndpointRetryablePersistenceClient) GetName() string {
 	return p.persistence.GetName()
 }
 
-func (p *nexusIncomingServiceRetryablePersistenceClient) Close() {
+func (p *nexusEndpointRetryablePersistenceClient) Close() {
 	p.persistence.Close()
 }
 
-func (p *nexusIncomingServiceRetryablePersistenceClient) GetNexusIncomingServicesTableVersion(
+func (p *nexusEndpointRetryablePersistenceClient) GetNexusEndpoint(
 	ctx context.Context,
-) (int64, error) {
-	var response int64
+	request *GetNexusEndpointRequest,
+) (*persistencespb.NexusEndpointEntry, error) {
+	var response *persistencespb.NexusEndpointEntry
 	op := func(ctx context.Context) error {
 		var err error
-		response, err = p.persistence.GetNexusIncomingServicesTableVersion(ctx)
+		response, err = p.persistence.GetNexusEndpoint(ctx, request)
 		return err
 	}
 	err := backoff.ThrottleRetryContext(ctx, op, p.policy, p.isRetryable)
 	return response, err
 }
 
-func (p *nexusIncomingServiceRetryablePersistenceClient) ListNexusIncomingServices(
+func (p *nexusEndpointRetryablePersistenceClient) ListNexusEndpoints(
 	ctx context.Context,
-	request *ListNexusIncomingServicesRequest,
-) (*ListNexusIncomingServicesResponse, error) {
-	var response *ListNexusIncomingServicesResponse
+	request *ListNexusEndpointsRequest,
+) (*ListNexusEndpointsResponse, error) {
+	var response *ListNexusEndpointsResponse
 	op := func(ctx context.Context) error {
 		var err error
-		response, err = p.persistence.ListNexusIncomingServices(ctx, request)
+		response, err = p.persistence.ListNexusEndpoints(ctx, request)
 		return err
 	}
 	err := backoff.ThrottleRetryContext(ctx, op, p.policy, p.isRetryable)
 	return response, err
 }
 
-func (p *nexusIncomingServiceRetryablePersistenceClient) CreateOrUpdateNexusIncomingService(
+func (p *nexusEndpointRetryablePersistenceClient) CreateOrUpdateNexusEndpoint(
 	ctx context.Context,
-	request *CreateOrUpdateNexusIncomingServiceRequest,
-) (*CreateOrUpdateNexusIncomingServiceResponse, error) {
-	var response *CreateOrUpdateNexusIncomingServiceResponse
+	request *CreateOrUpdateNexusEndpointRequest,
+) (*CreateOrUpdateNexusEndpointResponse, error) {
+	var response *CreateOrUpdateNexusEndpointResponse
 	op := func(ctx context.Context) error {
 		var err error
-		response, err = p.persistence.CreateOrUpdateNexusIncomingService(ctx, request)
+		response, err = p.persistence.CreateOrUpdateNexusEndpoint(ctx, request)
 		return err
 	}
 	err := backoff.ThrottleRetryContext(ctx, op, p.policy, p.isRetryable)
 	return response, err
 }
 
-func (p *nexusIncomingServiceRetryablePersistenceClient) DeleteNexusIncomingService(
+func (p *nexusEndpointRetryablePersistenceClient) DeleteNexusEndpoint(
 	ctx context.Context,
-	request *DeleteNexusIncomingServiceRequest,
+	request *DeleteNexusEndpointRequest,
 ) error {
 	op := func(ctx context.Context) error {
-		return p.persistence.DeleteNexusIncomingService(ctx, request)
+		return p.persistence.DeleteNexusEndpoint(ctx, request)
 	}
 	return backoff.ThrottleRetryContext(ctx, op, p.policy, p.isRetryable)
 }

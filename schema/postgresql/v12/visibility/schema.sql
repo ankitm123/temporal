@@ -10,6 +10,7 @@ $$ LANGUAGE plpgsql IMMUTABLE RETURNS NULL ON NULL INPUT;
 CREATE TABLE executions_visibility (
   namespace_id            CHAR(64)      NOT NULL,
   run_id                  CHAR(64)      NOT NULL,
+  _version                BIGINT        NOT NULL DEFAULT 0, -- increasing version, used to reject upserts which are out of order
   start_time              TIMESTAMP     NOT NULL,
   execution_time          TIMESTAMP     NOT NULL,
   workflow_id             VARCHAR(255)  NOT NULL,
@@ -26,6 +27,8 @@ CREATE TABLE executions_visibility (
   search_attributes       JSONB         NULL,
   parent_workflow_id      VARCHAR(255)  NULL,
   parent_run_id           VARCHAR(255)  NULL,
+  root_workflow_id        VARCHAR(255)  NOT NULL DEFAULT '',
+  root_run_id             VARCHAR(255)  NOT NULL DEFAULT '',
 
   -- Each search attribute has its own generated column.
   -- Since PostgreSQL doesn't support virtual columns, all columns are stored.
@@ -41,6 +44,10 @@ CREATE TABLE executions_visibility (
   TemporalSchedulePaused        BOOLEAN       GENERATED ALWAYS AS ((search_attributes->'TemporalSchedulePaused')::boolean)        STORED,
   TemporalNamespaceDivision     VARCHAR(255)  GENERATED ALWAYS AS (search_attributes->>'TemporalNamespaceDivision')               STORED,
   BuildIds                      JSONB         GENERATED ALWAYS AS (search_attributes->'BuildIds')                                 STORED,
+  TemporalPauseInfo             JSONB         GENERATED ALWAYS AS (search_attributes->'TemporalPauseInfo')                        STORED,
+  TemporalWorkerDeploymentVersion    VARCHAR(255)    GENERATED ALWAYS AS (search_attributes->>'TemporalWorkerDeploymentVersion')          STORED,
+  TemporalWorkflowVersioningBehavior VARCHAR(255)    GENERATED ALWAYS AS (search_attributes->>'TemporalWorkflowVersioningBehavior')       STORED,
+  TemporalWorkerDeployment           VARCHAR(255)    GENERATED ALWAYS AS (search_attributes->>'TemporalWorkerDeployment')                 STORED,
 
   -- Pre-allocated custom search attributes
   Bool01          BOOLEAN         GENERATED ALWAYS AS ((search_attributes->'Bool01')::boolean)        STORED,
@@ -87,11 +94,17 @@ CREATE INDEX by_state_transition_count  ON executions_visibility (namespace_id, 
 CREATE INDEX by_task_queue              ON executions_visibility (namespace_id, task_queue,             (COALESCE(close_time, '9999-12-31 23:59:59')) DESC, start_time DESC, run_id);
 CREATE INDEX by_parent_workflow_id      ON executions_visibility (namespace_id, parent_workflow_id,     (COALESCE(close_time, '9999-12-31 23:59:59')) DESC, start_time DESC, run_id);
 CREATE INDEX by_parent_run_id           ON executions_visibility (namespace_id, parent_run_id,          (COALESCE(close_time, '9999-12-31 23:59:59')) DESC, start_time DESC, run_id);
+CREATE INDEX by_root_workflow_id        ON executions_visibility (namespace_id, root_workflow_id,       (COALESCE(close_time, '9999-12-31 23:59:59')) DESC, start_time DESC, run_id);
+CREATE INDEX by_root_run_id             ON executions_visibility (namespace_id, root_run_id,            (COALESCE(close_time, '9999-12-31 23:59:59')) DESC, start_time DESC, run_id);
 
 -- Indexes for the predefined search attributes
 CREATE INDEX by_temporal_change_version       ON executions_visibility USING GIN (namespace_id, TemporalChangeVersion jsonb_path_ops);
 CREATE INDEX by_binary_checksums              ON executions_visibility USING GIN (namespace_id, BinaryChecksums jsonb_path_ops);
 CREATE INDEX by_build_ids                     ON executions_visibility USING GIN (namespace_id, BuildIds jsonb_path_ops);
+CREATE INDEX by_temporal_pause_info           ON executions_visibility USING GIN (namespace_id, TemporalPauseInfo jsonb_path_ops);
+CREATE INDEX by_temporal_worker_deployment_version ON executions_visibility (namespace_id, TemporalWorkerDeploymentVersion,  (COALESCE(close_time, '9999-12-31 23:59:59')) DESC, start_time DESC, run_id);
+CREATE INDEX by_temporal_workflow_versioning_behavior ON executions_visibility (namespace_id, TemporalWorkflowVersioningBehavior,  (COALESCE(close_time, '9999-12-31 23:59:59')) DESC, start_time DESC, run_id);
+CREATE INDEX by_temporal_worker_deployment    ON executions_visibility (namespace_id, TemporalWorkerDeployment,  (COALESCE(close_time, '9999-12-31 23:59:59')) DESC, start_time DESC, run_id);
 CREATE INDEX by_batcher_user                  ON executions_visibility (namespace_id, BatcherUser,                (COALESCE(close_time, '9999-12-31 23:59:59')) DESC, start_time DESC, run_id);
 CREATE INDEX by_temporal_scheduled_start_time ON executions_visibility (namespace_id, TemporalScheduledStartTime, (COALESCE(close_time, '9999-12-31 23:59:59')) DESC, start_time DESC, run_id);
 CREATE INDEX by_temporal_scheduled_by_id      ON executions_visibility (namespace_id, TemporalScheduledById,      (COALESCE(close_time, '9999-12-31 23:59:59')) DESC, start_time DESC, run_id);

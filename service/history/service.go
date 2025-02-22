@@ -28,18 +28,18 @@ import (
 	"net"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/health"
-	healthpb "google.golang.org/grpc/health/grpc_health_v1"
-
 	"go.temporal.io/server/api/historyservice/v1"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/membership"
 	"go.temporal.io/server/common/metrics"
-	"go.temporal.io/server/common/persistence/client"
 	"go.temporal.io/server/common/persistence/visibility/manager"
+	"go.temporal.io/server/common/util"
 	"go.temporal.io/server/service/history/configs"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
 )
 
 // Service represents the history service
@@ -49,18 +49,17 @@ type (
 		visibilityManager manager.VisibilityManager
 		config            *configs.Config
 
-		server                         *grpc.Server
-		logger                         log.Logger
-		grpcListener                   net.Listener
-		membershipMonitor              membership.Monitor
-		faultInjectionDataStoreFactory *client.FaultInjectionDataStoreFactory
-		metricsHandler                 metrics.Handler
-		healthServer                   *health.Server
+		server            *grpc.Server
+		logger            log.Logger
+		grpcListener      net.Listener
+		membershipMonitor membership.Monitor
+		metricsHandler    metrics.Handler
+		healthServer      *health.Server
 	}
 )
 
 func NewService(
-	grpcServerOptions []grpc.ServerOption,
+	server *grpc.Server,
 	serviceConfig *configs.Config,
 	visibilityMgr manager.VisibilityManager,
 	handler *Handler,
@@ -68,20 +67,18 @@ func NewService(
 	grpcListener net.Listener,
 	membershipMonitor membership.Monitor,
 	metricsHandler metrics.Handler,
-	faultInjectionDataStoreFactory *client.FaultInjectionDataStoreFactory,
 	healthServer *health.Server,
 ) *Service {
 	return &Service{
-		server:                         grpc.NewServer(grpcServerOptions...),
-		handler:                        handler,
-		visibilityManager:              visibilityMgr,
-		config:                         serviceConfig,
-		logger:                         logger,
-		grpcListener:                   grpcListener,
-		membershipMonitor:              membershipMonitor,
-		metricsHandler:                 metricsHandler,
-		faultInjectionDataStoreFactory: faultInjectionDataStoreFactory,
-		healthServer:                   healthServer,
+		server:            server,
+		handler:           handler,
+		visibilityManager: visibilityMgr,
+		config:            serviceConfig,
+		logger:            logger,
+		grpcListener:      grpcListener,
+		membershipMonitor: membershipMonitor,
+		metricsHandler:    metricsHandler,
+		healthServer:      healthServer,
 	}
 }
 
@@ -96,6 +93,8 @@ func (s *Service) Start() {
 	historyservice.RegisterHistoryServiceServer(s.server, s.handler)
 	healthpb.RegisterHealthServer(s.server, s.healthServer)
 	s.healthServer.SetServingStatus(serviceName, healthpb.HealthCheckResponse_SERVING)
+
+	reflection.Register(s.server)
 
 	go func() {
 		s.logger.Info("Starting to serve on history listener")
@@ -121,29 +120,49 @@ func (s *Service) Start() {
 
 // Stop stops the service
 func (s *Service) Stop() {
-	s.logger.Info("ShutdownHandler: Evicting self from membership ring")
-	_ = s.membershipMonitor.EvictSelf()
-
-	if delay := s.config.ShutdownDrainDuration(); delay > 0 {
-		s.logger.Info("ShutdownHandler: delaying for shutdown drain",
-			tag.NewDurationTag("shutdownDrainDuration", delay))
-		time.Sleep(delay)
+	// remove self from membership ring and wait for traffic to drain
+	var err error
+	var waitTime time.Duration
+	if align := s.config.AlignMembershipChange(); align > 0 {
+		propagation := s.membershipMonitor.ApproximateMaxPropagationTime()
+		asOf := util.NextAlignedTime(time.Now().Add(propagation), align)
+		s.logger.Info("ShutdownHandler: Evicting self from membership ring as of", tag.Timestamp(asOf))
+		waitTime, err = s.membershipMonitor.EvictSelfAt(asOf)
+	} else {
+		s.logger.Info("ShutdownHandler: Evicting self from membership ring immediately")
+		err = s.membershipMonitor.EvictSelf()
 	}
-
+	if err != nil {
+		s.logger.Error("ShutdownHandler: Failed to evict self from membership ring", tag.Error(err))
+	}
 	s.healthServer.SetServingStatus(serviceName, healthpb.HealthCheckResponse_NOT_SERVING)
 
+	s.logger.Info("ShutdownHandler: Waiting for drain")
+	if waitTime > 0 {
+		time.Sleep(
+			waitTime + // wait for membership change
+				s.config.ShardLingerTimeLimit() + // after membership change shards may linger before close
+				s.config.ShardFinalizerTimeout(), // and then take this long to run a finalizer
+		)
+	} else {
+		time.Sleep(s.config.ShutdownDrainDuration())
+	}
+
+	// Stop shard controller. We should have waited long enough for all shards to realize they
+	// lost ownership and close, but if not, this will definitely close them.
 	s.logger.Info("ShutdownHandler: Initiating shardController shutdown")
 	s.handler.controller.Stop()
 
-	// TODO: Change this to GracefulStop when integration tests are refactored.
-	s.server.Stop()
+	// All grpc handlers should be cancelled now. Give them a little time to return.
+	t := time.AfterFunc(2*time.Second, func() {
+		s.logger.Info("ShutdownHandler: Drain time expired, stopping all traffic")
+		s.server.Stop()
+	})
+	s.server.GracefulStop()
+	t.Stop()
 
 	s.handler.Stop()
 	s.visibilityManager.Close()
 
 	s.logger.Info("history stopped")
-}
-
-func (s *Service) GetFaultInjection() *client.FaultInjectionDataStoreFactory {
-	return s.faultInjectionDataStoreFactory
 }

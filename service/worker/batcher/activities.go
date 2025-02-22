@@ -38,8 +38,6 @@ import (
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/activity"
 	sdkclient "go.temporal.io/sdk/client"
-	"golang.org/x/time/rate"
-
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
@@ -48,10 +46,13 @@ import (
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/sdk"
+	"golang.org/x/time/rate"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 const (
-	pageSize = 1000
+	pageSize                 = 1000
+	statusRunningQueryFilter = "ExecutionStatus='Running'"
 )
 
 var (
@@ -109,11 +110,13 @@ func (a *activities) BatchActivity(ctx context.Context, batchParams BatchParams)
 		}
 	}
 
+	adjustedQuery := a.adjustQuery(batchParams)
+
 	if startOver {
 		estimateCount := int64(len(batchParams.Executions))
-		if len(batchParams.Query) > 0 {
+		if len(adjustedQuery) > 0 {
 			resp, err := sdkClient.CountWorkflow(ctx, &workflowservice.CountWorkflowExecutionsRequest{
-				Query: batchParams.Query,
+				Query: adjustedQuery,
 			})
 			if err != nil {
 				metrics.BatcherOperationFailures.With(metricsHandler).Record(1)
@@ -137,11 +140,11 @@ func (a *activities) BatchActivity(ctx context.Context, batchParams BatchParams)
 	for {
 		executions := batchParams.Executions
 		pageToken := hbd.PageToken
-		if len(batchParams.Query) > 0 {
+		if len(adjustedQuery) > 0 {
 			resp, err := sdkClient.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{
 				PageSize:      int32(pageSize),
 				NextPageToken: pageToken,
-				Query:         batchParams.Query,
+				Query:         adjustedQuery,
 			})
 			if err != nil {
 				metrics.BatcherOperationFailures.With(metricsHandler).Record(1)
@@ -211,6 +214,20 @@ func (a *activities) getActivityLogger(ctx context.Context) log.Logger {
 		tag.WorkflowRunID(wfInfo.WorkflowExecution.RunID),
 		tag.WorkflowNamespace(wfInfo.WorkflowNamespace),
 	)
+}
+
+func (a *activities) adjustQuery(batchParams BatchParams) string {
+	if len(batchParams.Query) == 0 {
+		// don't add anything if query is empty
+		return batchParams.Query
+	}
+
+	switch batchParams.BatchType {
+	case BatchTypeTerminate, BatchTypeSignal, BatchTypeCancel, BatchTypeUpdateOptions, BatchTypeUnpauseActivities:
+		return fmt.Sprintf("(%s) AND (%s)", batchParams.Query, statusRunningQueryFilter)
+	default:
+		return batchParams.Query
+	}
 }
 
 func (a *activities) getOperationRPS(requestedRPS float64) float64 {
@@ -296,11 +313,13 @@ func startTaskProcessor(
 						var eventId int64
 						var err error
 						var resetReapplyType enumspb.ResetReapplyType
+						var resetReapplyExcludeTypes []enumspb.ResetReapplyExcludeType
 						if batchParams.ResetParams.resetOptions != nil {
 							// Using ResetOptions
 							// Note: getResetEventIDByOptions may modify workflowExecution.RunId, if reset should be to a prior run
 							eventId, err = getResetEventIDByOptions(ctx, batchParams.ResetParams.resetOptions, batchParams.Namespace, workflowExecution, frontendClient, logger)
 							resetReapplyType = batchParams.ResetParams.resetOptions.ResetReapplyType
+							resetReapplyExcludeTypes = batchParams.ResetParams.resetOptions.ResetReapplyExcludeTypes
 						} else {
 							// Old fields
 							eventId, err = getResetEventIDByType(ctx, batchParams.ResetParams.ResetType, batchParams.Namespace, workflowExecution, frontendClient, logger)
@@ -316,6 +335,47 @@ func startTaskProcessor(
 							RequestId:                 uuid.New(),
 							WorkflowTaskFinishEventId: eventId,
 							ResetReapplyType:          resetReapplyType,
+							ResetReapplyExcludeTypes:  resetReapplyExcludeTypes,
+						})
+						return err
+					})
+			case BatchTypeUnpauseActivities:
+				err = processTask(ctx, limiter, task,
+					func(workflowID, runID string) error {
+						unpauseRequest := &workflowservice.UnpauseActivityRequest{
+							Namespace: batchParams.Namespace,
+							Execution: &commonpb.WorkflowExecution{
+								WorkflowId: workflowID,
+								RunId:      runID,
+							},
+							Identity:       "batch unpause",
+							Activity:       &workflowservice.UnpauseActivityRequest_Type{Type: batchParams.UnpauseActivitiesParams.ActivityType},
+							ResetAttempts:  !batchParams.UnpauseActivitiesParams.ResetAttempts,
+							ResetHeartbeat: batchParams.UnpauseActivitiesParams.ResetHeartbeat,
+							Jitter:         durationpb.New(batchParams.UnpauseActivitiesParams.Jitter),
+						}
+
+						if batchParams.UnpauseActivitiesParams.MatchAll {
+							unpauseRequest.Activity = &workflowservice.UnpauseActivityRequest_UnpauseAll{UnpauseAll: true}
+						} else {
+							unpauseRequest.Activity = &workflowservice.UnpauseActivityRequest_Type{Type: batchParams.UnpauseActivitiesParams.ActivityType}
+						}
+						_, err = frontendClient.UnpauseActivity(ctx, unpauseRequest)
+						return err
+					})
+
+			case BatchTypeUpdateOptions:
+				err = processTask(ctx, limiter, task,
+					func(workflowID, runID string) error {
+						var err error
+						_, err = frontendClient.UpdateWorkflowExecutionOptions(ctx, &workflowservice.UpdateWorkflowExecutionOptionsRequest{
+							Namespace: batchParams.Namespace,
+							WorkflowExecution: &commonpb.WorkflowExecution{
+								WorkflowId: workflowID,
+								RunId:      runID,
+							},
+							WorkflowExecutionOptions: batchParams.UpdateOptionsParams.WorkflowExecutionOptions,
+							UpdateMask:               batchParams.UpdateOptionsParams.UpdateMask,
 						})
 						return err
 					})
@@ -409,7 +469,7 @@ func getResetEventIDByOptions(
 	case *commonpb.ResetOptions_WorkflowTaskId:
 		return target.WorkflowTaskId, nil
 	case *commonpb.ResetOptions_BuildId:
-		return getResetPoint(ctx, namespaceStr, workflowExecution, frontendClient, logger, target.BuildId, resetOptions.CurrentRunOnly)
+		return getResetPoint(ctx, namespaceStr, workflowExecution, frontendClient, target.BuildId, resetOptions.CurrentRunOnly)
 	default:
 		errorMsg := fmt.Sprintf("provided reset target (%+v) is not supported.", resetOptions.Target)
 		return 0, serviceerror.NewInvalidArgument(errorMsg)
@@ -502,7 +562,6 @@ func getResetPoint(
 	namespaceStr string,
 	execution *commonpb.WorkflowExecution,
 	frontendClient workflowservice.WorkflowServiceClient,
-	logger log.Logger,
 	buildId string,
 	currentRunOnly bool,
 ) (workflowTaskEventID int64, err error) {

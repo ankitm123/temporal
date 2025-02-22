@@ -30,7 +30,6 @@ import (
 	"sync"
 
 	"go.temporal.io/api/serviceerror"
-
 	"go.temporal.io/server/api/adminservice/v1"
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	replicationspb "go.temporal.io/server/api/replication/v1"
@@ -40,6 +39,7 @@ import (
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/namespace/nsreplication"
 	"go.temporal.io/server/common/persistence"
 )
 
@@ -57,7 +57,7 @@ type (
 		logger                  log.Logger
 		lock                    sync.Mutex
 		clientBean              client.Bean
-		replicationTaskExecutor namespace.ReplicationTaskExecutor
+		replicationTaskExecutor nsreplication.TaskExecutor
 		currentCluster          string
 		metricsHandler          metrics.Handler
 	}
@@ -68,7 +68,7 @@ func NewEagerNamespaceRefresher(
 	namespaceRegistry namespace.Registry,
 	logger log.Logger,
 	clientBean client.Bean,
-	replicationTaskExecutor namespace.ReplicationTaskExecutor,
+	replicationTaskExecutor nsreplication.TaskExecutor,
 	currentCluster string,
 	metricsHandler metrics.Handler) EagerNamespaceRefresher {
 	return &eagerNamespaceRefresherImpl{
@@ -146,12 +146,6 @@ func (e *eagerNamespaceRefresherImpl) SyncNamespaceFromSourceCluster(
 	namespaceId namespace.ID,
 	sourceCluster string,
 ) (*namespace.Namespace, error) {
-	/* TODO: 1. Lock here is to prevent multiple creation happening at same time. Current implementation
-	   actually does not help in this case(i.e. after getting the lock, each thread will still fetch from remote and
-	   try to create the namespace). Once we have mechanism to immediate refresh the cache, we
-	   can add logic to check the cache again before doing the remote call and creating namespace
-	   2. Based on which caller is invoking this method, we may not want to block the caller thread.
-	*/
 	e.lock.Lock()
 	defer e.lock.Unlock()
 	adminClient, err := e.clientBean.GetRemoteAdminClient(sourceCluster)
@@ -179,8 +173,18 @@ func (e *eagerNamespaceRefresherImpl) SyncNamespaceFromSourceCluster(
 		metrics.ReplicationOutlierNamespace.With(e.metricsHandler).Record(1)
 		return nil, serviceerror.NewFailedPrecondition("Namespace does not belong to current cluster")
 	}
+	_, err = e.namespaceRegistry.GetNamespaceByID(namespaceId)
+	var operation enumsspb.NamespaceOperation
+	switch err.(type) {
+	case *serviceerror.NamespaceNotFound:
+		operation = enumsspb.NAMESPACE_OPERATION_CREATE
+	case nil:
+		operation = enumsspb.NAMESPACE_OPERATION_UPDATE
+	default:
+		return nil, err
+	}
 	task := &replicationspb.NamespaceTaskAttributes{
-		NamespaceOperation: enumsspb.NAMESPACE_OPERATION_CREATE,
+		NamespaceOperation: operation,
 		Id:                 resp.GetInfo().Id,
 		Info:               resp.GetInfo(),
 		Config:             resp.GetConfig(),
@@ -193,6 +197,5 @@ func (e *eagerNamespaceRefresherImpl) SyncNamespaceFromSourceCluster(
 	if err != nil {
 		return nil, err
 	}
-	namespaceEntry := namespace.FromAdminClientApiResponse(resp)
-	return namespaceEntry, err
+	return e.namespaceRegistry.RefreshNamespaceById(namespaceId)
 }
