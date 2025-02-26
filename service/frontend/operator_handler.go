@@ -27,13 +27,9 @@ package frontend
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync/atomic"
-
-	"golang.org/x/exp/maps"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/health"
-	healthpb "google.golang.org/grpc/health/grpc_health_v1"
-	"google.golang.org/grpc/status"
+	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
@@ -42,7 +38,6 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
-
 	"go.temporal.io/server/api/adminservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	svc "go.temporal.io/server/client"
@@ -67,6 +62,11 @@ import (
 	"go.temporal.io/server/service/worker/addsearchattributes"
 	"go.temporal.io/server/service/worker/deletenamespace"
 	"go.temporal.io/server/service/worker/deletenamespace/deleteexecutions"
+	delnserrors "go.temporal.io/server/service/worker/deletenamespace/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 )
 
 var _ OperatorHandler = (*OperatorHandlerImpl)(nil)
@@ -74,7 +74,7 @@ var _ OperatorHandler = (*OperatorHandlerImpl)(nil)
 type (
 	// OperatorHandlerImpl - gRPC handler interface for operator service
 	OperatorHandlerImpl struct {
-		operatorservice.UnsafeOperatorServiceServer
+		operatorservice.UnimplementedOperatorServiceServer
 
 		status int32
 
@@ -90,6 +90,8 @@ type (
 		clusterMetadataManager persistence.ClusterMetadataManager
 		clusterMetadata        clustermetadata.Metadata
 		clientFactory          svc.Factory
+		namespaceRegistry      namespace.Registry
+		nexusEndpointClient    *NexusEndpointClient
 	}
 
 	NewOperatorHandlerImplArgs struct {
@@ -105,6 +107,8 @@ type (
 		clusterMetadataManager persistence.ClusterMetadataManager
 		clusterMetadata        clustermetadata.Metadata
 		clientFactory          svc.Factory
+		namespaceRegistry      namespace.Registry
+		nexusEndpointClient    *NexusEndpointClient
 	}
 )
 
@@ -133,6 +137,8 @@ func NewOperatorHandlerImpl(
 		clusterMetadataManager: args.clusterMetadataManager,
 		clusterMetadata:        args.clusterMetadata,
 		clientFactory:          args.clientFactory,
+		namespaceRegistry:      args.namespaceRegistry,
+		nexusEndpointClient:    args.nexusEndpointClient,
 	}
 
 	return handler
@@ -324,7 +330,7 @@ func (h *OperatorHandlerImpl) addSearchAttributesSQL(
 		&workflowservice.DescribeNamespaceRequest{Namespace: nsName},
 	)
 	if err != nil {
-		return serviceerror.NewUnavailable(fmt.Sprintf(errUnableToGetNamespaceInfoMessage, nsName))
+		return serviceerror.NewUnavailable(fmt.Sprintf(errUnableToGetNamespaceInfoMessage, nsName, err))
 	}
 
 	dbCustomSearchAttributes := searchattribute.GetSqlDbIndexSearchAttributes().CustomSearchAttributes
@@ -476,7 +482,7 @@ func (h *OperatorHandlerImpl) removeSearchAttributesSQL(
 		&workflowservice.DescribeNamespaceRequest{Namespace: nsName},
 	)
 	if err != nil {
-		return serviceerror.NewUnavailable(fmt.Sprintf(errUnableToGetNamespaceInfoMessage, nsName))
+		return serviceerror.NewUnavailable(fmt.Sprintf(errUnableToGetNamespaceInfoMessage, nsName, err))
 	}
 
 	upsertFieldToAliasMap := make(map[string]string)
@@ -577,7 +583,7 @@ func (h *OperatorHandlerImpl) listSearchAttributesSQL(
 	)
 	if err != nil {
 		return nil, serviceerror.NewUnavailable(
-			fmt.Sprintf(errUnableToGetNamespaceInfoMessage, nsName),
+			fmt.Sprintf(errUnableToGetNamespaceInfoMessage, nsName, err),
 		)
 	}
 
@@ -601,17 +607,15 @@ func (h *OperatorHandlerImpl) DeleteNamespace(
 ) (_ *operatorservice.DeleteNamespaceResponse, retError error) {
 	defer log.CapturePanic(h.logger, &retError)
 
-	// validate request
 	if request == nil {
 		return nil, errRequestNotSet
 	}
 
-	if request.GetNamespace() == primitives.SystemLocalNamespace || request.GetNamespaceId() == primitives.SystemNamespaceID {
-		return nil, errUnableDeleteSystemNamespace
-	}
-
-	namespaceDeleteDelay := h.config.DeleteNamespaceNamespaceDeleteDelay()
-	if request.NamespaceDeleteDelay != nil {
+	// If NamespaceDeleteDelay is not provided, the default delay configured in the cluster should be used.
+	var namespaceDeleteDelay time.Duration
+	if request.NamespaceDeleteDelay == nil {
+		namespaceDeleteDelay = h.config.DeleteNamespaceNamespaceDeleteDelay()
+	} else {
 		namespaceDeleteDelay = request.NamespaceDeleteDelay.AsDuration()
 	}
 
@@ -642,17 +646,12 @@ func (h *OperatorHandlerImpl) DeleteNamespace(
 		return nil, serviceerror.NewUnavailable(fmt.Sprintf(errUnableToStartWorkflowMessage, deletenamespace.WorkflowName, err))
 	}
 
-	scope := h.metricsHandler.WithTags(metrics.OperationTag(metrics.OperatorDeleteNamespaceScope))
-
-	// Wait for workflow to complete.
+	// Wait for the workflow to complete.
 	var wfResult deletenamespace.DeleteNamespaceWorkflowResult
 	err = run.Get(ctx, &wfResult)
 	if err != nil {
-		metrics.DeleteNamespaceWorkflowFailuresCount.With(scope).Record(1)
-		execution := &commonpb.WorkflowExecution{WorkflowId: deletenamespace.WorkflowName, RunId: run.GetRunID()}
-		return nil, serviceerror.NewSystemWorkflow(execution, err)
+		return nil, delnserrors.ToServiceError(err, run.GetID(), run.GetRunID())
 	}
-	metrics.DeleteNamespaceWorkflowSuccessCount.With(scope).Record(1)
 
 	return &operatorservice.DeleteNamespaceResponse{
 		DeletedNamespace: wfResult.DeletedNamespace.String(),
@@ -707,6 +706,7 @@ func (h *OperatorHandlerImpl) AddOrUpdateRemoteCluster(
 			HistoryShardCount:        resp.GetHistoryShardCount(),
 			ClusterId:                resp.GetClusterId(),
 			ClusterAddress:           request.GetFrontendAddress(),
+			HttpAddress:              resp.GetHttpAddress(),
 			FailoverVersionIncrement: resp.GetFailoverVersionIncrement(),
 			InitialFailoverVersion:   resp.GetInitialFailoverVersion(),
 			IsGlobalNamespaceEnabled: resp.GetIsGlobalNamespaceEnabled(),
@@ -755,7 +755,6 @@ func (h *OperatorHandlerImpl) ListClusters(
 	request *operatorservice.ListClustersRequest,
 ) (_ *operatorservice.ListClustersResponse, retError error) {
 	defer log.CapturePanic(h.logger, &retError)
-
 	if request == nil {
 		return nil, errRequestNotSet
 	}
@@ -777,6 +776,7 @@ func (h *OperatorHandlerImpl) ListClusters(
 			ClusterName:            clusterResp.GetClusterName(),
 			ClusterId:              clusterResp.GetClusterId(),
 			Address:                clusterResp.GetClusterAddress(),
+			HttpAddress:            clusterResp.GetHttpAddress(),
 			InitialFailoverVersion: clusterResp.GetInitialFailoverVersion(),
 			HistoryShardCount:      clusterResp.GetHistoryShardCount(),
 			IsConnectionEnabled:    clusterResp.GetIsConnectionEnabled(),
@@ -824,18 +824,57 @@ func (h *OperatorHandlerImpl) validateRemoteClusterMetadata(metadata *adminservi
 	return nil
 }
 
-func (*OperatorHandlerImpl) CreateOrUpdateNexusIncomingService(context.Context, *operatorservice.CreateOrUpdateNexusIncomingServiceRequest) (*operatorservice.CreateOrUpdateNexusIncomingServiceResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "unimplemented")
+func (h *OperatorHandlerImpl) CreateNexusEndpoint(
+	ctx context.Context,
+	request *operatorservice.CreateNexusEndpointRequest,
+) (_ *operatorservice.CreateNexusEndpointResponse, retErr error) {
+	defer log.CapturePanic(h.logger, &retErr)
+	if !h.config.EnableNexusAPIs() {
+		return nil, status.Error(codes.NotFound, "Nexus APIs are disabled")
+	}
+	return h.nexusEndpointClient.Create(ctx, request)
 }
 
-func (*OperatorHandlerImpl) DeleteNexusIncomingService(context.Context, *operatorservice.DeleteNexusIncomingServiceRequest) (*operatorservice.DeleteNexusIncomingServiceResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "unimplemented")
+func (h *OperatorHandlerImpl) UpdateNexusEndpoint(
+	ctx context.Context,
+	request *operatorservice.UpdateNexusEndpointRequest,
+) (_ *operatorservice.UpdateNexusEndpointResponse, retErr error) {
+	defer log.CapturePanic(h.logger, &retErr)
+	if !h.config.EnableNexusAPIs() {
+		return nil, status.Error(codes.NotFound, "Nexus APIs are disabled")
+	}
+	return h.nexusEndpointClient.Update(ctx, request)
 }
 
-func (*OperatorHandlerImpl) GetNexusIncomingService(context.Context, *operatorservice.GetNexusIncomingServiceRequest) (*operatorservice.GetNexusIncomingServiceResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "unimplemented")
+func (h *OperatorHandlerImpl) DeleteNexusEndpoint(
+	ctx context.Context,
+	request *operatorservice.DeleteNexusEndpointRequest,
+) (_ *operatorservice.DeleteNexusEndpointResponse, retErr error) {
+	defer log.CapturePanic(h.logger, &retErr)
+	if !h.config.EnableNexusAPIs() {
+		return nil, status.Error(codes.NotFound, "Nexus APIs are disabled")
+	}
+	return h.nexusEndpointClient.Delete(ctx, request)
 }
 
-func (*OperatorHandlerImpl) ListNexusIncomingServices(context.Context, *operatorservice.ListNexusIncomingServicesRequest) (*operatorservice.ListNexusIncomingServicesResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "unimplemented")
+func (h *OperatorHandlerImpl) GetNexusEndpoint(
+	ctx context.Context,
+	request *operatorservice.GetNexusEndpointRequest,
+) (_ *operatorservice.GetNexusEndpointResponse, retErr error) {
+	defer log.CapturePanic(h.logger, &retErr)
+	if !h.config.EnableNexusAPIs() {
+		return nil, status.Error(codes.NotFound, "Nexus APIs are disabled")
+	}
+	return h.nexusEndpointClient.Get(ctx, request)
+}
+
+func (h *OperatorHandlerImpl) ListNexusEndpoints(
+	ctx context.Context,
+	request *operatorservice.ListNexusEndpointsRequest,
+) (_ *operatorservice.ListNexusEndpointsResponse, retErr error) {
+	defer log.CapturePanic(h.logger, &retErr)
+	if !h.config.EnableNexusAPIs() {
+		return nil, status.Error(codes.NotFound, "Nexus APIs are disabled")
+	}
+	return h.nexusEndpointClient.List(ctx, request)
 }

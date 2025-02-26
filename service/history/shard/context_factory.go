@@ -25,8 +25,6 @@
 package shard
 
 import (
-	"go.uber.org/fx"
-
 	"go.temporal.io/server/client"
 	"go.temporal.io/server/common/archiver"
 	"go.temporal.io/server/common/clock"
@@ -42,7 +40,9 @@ import (
 	"go.temporal.io/server/common/searchattribute"
 	"go.temporal.io/server/service/history/configs"
 	"go.temporal.io/server/service/history/events"
+	"go.temporal.io/server/service/history/hsm"
 	"go.temporal.io/server/service/history/tasks"
+	"go.uber.org/fx"
 )
 
 //go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination context_factory_mock.go
@@ -78,6 +78,8 @@ type (
 		TimeSource                  clock.TimeSource
 		TaskCategoryRegistry        tasks.TaskCategoryRegistry
 		EventsCache                 events.Cache
+
+		StateMachineRegistry *hsm.Registry
 	}
 
 	contextFactoryImpl struct {
@@ -118,6 +120,7 @@ func (c *contextFactoryImpl) CreateContext(
 		c.HostInfoProvider,
 		c.TaskCategoryRegistry,
 		c.EventsCache,
+		c.StateMachineRegistry,
 	)
 	if err != nil {
 		return nil, err

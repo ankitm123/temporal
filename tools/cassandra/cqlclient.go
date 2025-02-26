@@ -30,7 +30,6 @@ import (
 	"time"
 
 	"github.com/gocql/gocql"
-
 	"go.temporal.io/server/common/auth"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
@@ -56,6 +55,7 @@ type (
 		Port                     int
 		User                     string
 		Password                 string
+		AllowedAuthenticators    []string
 		Keyspace                 string
 		Timeout                  int
 		numReplicas              int
@@ -109,7 +109,6 @@ func newCQLClient(cfg *CQLClientConfig, logger log.Logger) (*cqlClient, error) {
 	var err error
 
 	cassandraConfig := cfg.toCassandraConfig()
-	cassandraConfig.ConnectTimeout = time.Duration(cfg.Timeout) * time.Second
 
 	logger.Info("Validating connection to cassandra cluster.")
 	session, err := commongocql.NewSession(
@@ -141,6 +140,7 @@ func (cfg *CQLClientConfig) toCassandraConfig() *config.Cassandra {
 		Port:                     cfg.Port,
 		User:                     cfg.User,
 		Password:                 cfg.Password,
+		AllowedAuthenticators:    cfg.AllowedAuthenticators,
 		Keyspace:                 cfg.Keyspace,
 		TLS:                      cfg.TLS,
 		Datacenter:               cfg.Datacenter,
@@ -151,6 +151,7 @@ func (cfg *CQLClientConfig) toCassandraConfig() *config.Cassandra {
 			},
 		},
 		AddressTranslator: cfg.AddressTranslator,
+		ConnectTimeout:    time.Duration(cfg.Timeout) * time.Second,
 	}
 
 	return &cassandraConfig

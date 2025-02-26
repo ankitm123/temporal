@@ -26,14 +26,13 @@ package configs
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.temporal.io/api/workflowservice/v1"
-	"golang.org/x/exp/slices"
-
 	"go.temporal.io/server/common/headers"
 	"go.temporal.io/server/common/quotas"
 	"go.temporal.io/server/common/testing/temporalapi"
@@ -118,9 +117,12 @@ func (s *quotasSuite) TestVisibilityAPIs() {
 		"/temporal.api.workflowservice.v1.WorkflowService/ListWorkflowExecutions":         {},
 		"/temporal.api.workflowservice.v1.WorkflowService/ListArchivedWorkflowExecutions": {},
 
-		"/temporal.api.workflowservice.v1.WorkflowService/GetWorkerTaskReachability": {},
-		"/temporal.api.workflowservice.v1.WorkflowService/ListSchedules":             {},
-		"/temporal.api.workflowservice.v1.WorkflowService/ListBatchOperations":       {},
+		"/temporal.api.workflowservice.v1.WorkflowService/GetWorkerTaskReachability":         {},
+		"/temporal.api.workflowservice.v1.WorkflowService/ListSchedules":                     {},
+		"/temporal.api.workflowservice.v1.WorkflowService/ListBatchOperations":               {},
+		"/temporal.api.workflowservice.v1.WorkflowService/DescribeTaskQueueWithReachability": {},
+		"/temporal.api.workflowservice.v1.WorkflowService/ListDeployments":                   {},
+		"/temporal.api.workflowservice.v1.WorkflowService/GetDeploymentReachability":         {},
 	}
 
 	var service workflowservice.WorkflowServiceServer
@@ -128,6 +130,9 @@ func (s *quotasSuite) TestVisibilityAPIs() {
 	apiToPriority := make(map[string]int, t.NumMethod())
 	for i := 0; i < t.NumMethod(); i++ {
 		apiName := "/temporal.api.workflowservice.v1.WorkflowService/" + t.Method(i).Name
+		if t.Method(i).Name == "DescribeTaskQueue" {
+			apiName += "WithReachability"
+		}
 		if _, ok := apis[apiName]; ok {
 			apiToPriority[apiName] = VisibilityAPIToPriority[apiName]
 		}
@@ -140,6 +145,7 @@ func (s *quotasSuite) TestNamespaceReplicationInducingAPIs() {
 		"/temporal.api.workflowservice.v1.WorkflowService/RegisterNamespace":                {},
 		"/temporal.api.workflowservice.v1.WorkflowService/UpdateNamespace":                  {},
 		"/temporal.api.workflowservice.v1.WorkflowService/UpdateWorkerBuildIdCompatibility": {},
+		"/temporal.api.workflowservice.v1.WorkflowService/UpdateWorkerVersioningRules":      {},
 	}
 
 	var service workflowservice.WorkflowServiceServer
@@ -170,8 +176,12 @@ func (s *quotasSuite) TestAllAPIs() {
 		_, ok := apisWithPriority["/temporal.api.workflowservice.v1.WorkflowService/"+m.Name]
 		s.True(ok, "missing priority for API: %v", m.Name)
 	})
-	_, ok := apisWithPriority["/temporal.api.nexusservice.v1.NexusService/DispatchNexusTask"]
-	s.True(ok, "missing priority for API: /temporal.api.nexusservice.v1.NexusService/DispatchNexusTask")
+	_, ok := apisWithPriority[DispatchNexusTaskByNamespaceAndTaskQueueAPIName]
+	s.Truef(ok, "missing priority for API: %q", DispatchNexusTaskByNamespaceAndTaskQueueAPIName)
+	_, ok = apisWithPriority[DispatchNexusTaskByEndpointAPIName]
+	s.Truef(ok, "missing priority for API: %q", DispatchNexusTaskByEndpointAPIName)
+	_, ok = apisWithPriority[CompleteNexusOperation]
+	s.Truef(ok, "missing priority for API: %q", CompleteNexusOperation)
 }
 
 func (s *quotasSuite) TestOperatorPriority_Execution() {

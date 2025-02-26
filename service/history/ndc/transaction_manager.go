@@ -31,11 +31,10 @@ import (
 
 	"github.com/pborman/uuid"
 	commonpb "go.temporal.io/api/common/v1"
-	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/serviceerror"
-
 	"go.temporal.io/server/common/cluster"
+	"go.temporal.io/server/common/locks"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
@@ -190,7 +189,7 @@ func NewTransactionManager(
 			logger,
 		),
 		eventsReapplier: eventsReapplier,
-		logger:          log.With(logger, tag.ComponentHistoryReplicator),
+		logger:          logger,
 
 		createMgr: nil,
 		updateMgr: nil,
@@ -305,6 +304,7 @@ func (r *transactionMgrImpl) backfillWorkflowEventsReapply(
 			if _, err := r.eventsReapplier.ReapplyEvents(
 				ctx,
 				targetWorkflow.GetMutableState(),
+				targetWorkflow.GetContext().UpdateRegistry(ctx),
 				totalEvents,
 				targetWorkflow.GetMutableState().GetExecutionState().GetRunId(),
 			); err != nil {
@@ -321,7 +321,7 @@ func (r *transactionMgrImpl) backfillWorkflowEventsReapply(
 		workflowID := baseMutableState.GetExecutionInfo().WorkflowId
 		baseRunID := baseMutableState.GetExecutionState().GetRunId()
 		resetRunID := uuid.New()
-		baseRebuildLastEventID := baseMutableState.GetLastWorkflowTaskStartedEventID()
+		baseRebuildLastEventID := baseMutableState.GetLastCompletedWorkflowTaskStartedEventId()
 		baseVersionHistories := baseMutableState.GetExecutionInfo().GetVersionHistories()
 		baseCurrentVersionHistory, err := versionhistory.GetCurrentVersionHistory(baseVersionHistories)
 		if err != nil {
@@ -346,9 +346,11 @@ func (r *transactionMgrImpl) backfillWorkflowEventsReapply(
 			resetRunID,
 			uuid.New(),
 			targetWorkflow,
+			targetWorkflow,
 			EventsReapplicationResetWorkflowReason,
 			totalEvents,
-			enumspb.RESET_REAPPLY_TYPE_SIGNAL,
+			nil,
+			false, // allowResetWithPendingChildren
 		)
 		switch err.(type) {
 		case *serviceerror.InvalidArgument:
@@ -448,7 +450,7 @@ func (r *transactionMgrImpl) LoadWorkflow(
 			WorkflowId: workflowID,
 			RunId:      runID,
 		},
-		workflow.LockPriorityHigh,
+		locks.PriorityHigh,
 	)
 	if err != nil {
 		return nil, err

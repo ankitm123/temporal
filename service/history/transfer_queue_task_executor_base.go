@@ -32,12 +32,11 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
-	"google.golang.org/protobuf/types/known/durationpb"
-
 	"go.temporal.io/server/api/matchingservice/v1"
 	taskqueuespb "go.temporal.io/server/api/taskqueue/v1"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/debug"
+	"go.temporal.io/server/common/locks"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
@@ -54,6 +53,7 @@ import (
 	"go.temporal.io/server/service/history/vclock"
 	"go.temporal.io/server/service/history/workflow"
 	wcache "go.temporal.io/server/service/history/workflow/cache"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 const (
@@ -118,8 +118,9 @@ func (t *transferQueueTaskExecutorBase) pushActivity(
 	task *tasks.ActivityTask,
 	activityScheduleToStartTimeout time.Duration,
 	directive *taskqueuespb.TaskVersionDirective,
+	transactionPolicy workflow.TransactionPolicy,
 ) error {
-	_, err := t.matchingRawClient.AddActivityTask(ctx, &matchingservice.AddActivityTaskRequest{
+	resp, err := t.matchingRawClient.AddActivityTask(ctx, &matchingservice.AddActivityTaskRequest{
 		NamespaceId: task.NamespaceID,
 		Execution: &commonpb.WorkflowExecution{
 			WorkflowId: task.WorkflowID,
@@ -133,6 +134,7 @@ func (t *transferQueueTaskExecutorBase) pushActivity(
 		ScheduleToStartTimeout: durationpb.New(activityScheduleToStartTimeout),
 		Clock:                  vclock.NewVectorClock(t.shardContext.GetClusterMetadata().GetClusterID(), t.shardContext.GetShardID(), task.TaskID),
 		VersionDirective:       directive,
+		Stamp:                  task.Stamp,
 	})
 	if _, isNotFound := err.(*serviceerror.NotFound); isNotFound {
 		// NotFound error is not expected for AddTasks calls
@@ -140,7 +142,25 @@ func (t *transferQueueTaskExecutorBase) pushActivity(
 		tasks.InitializeLogger(task, t.logger).Error("Matching returned not found error for AddActivityTask", tag.Error(err))
 	}
 
-	return err
+	if err != nil {
+		return err
+	}
+
+	if directive.GetUseAssignmentRules() == nil {
+		// activity is not getting a new build ID, so no need to update MS
+		return nil
+	}
+
+	return updateIndependentActivityBuildId(
+		ctx,
+		task,
+		resp.AssignedBuildId,
+		t.shardContext,
+		transactionPolicy,
+		t.cache,
+		t.metricHandler,
+		t.logger,
+	)
 }
 
 func (t *transferQueueTaskExecutorBase) pushWorkflowTask(
@@ -149,12 +169,13 @@ func (t *transferQueueTaskExecutorBase) pushWorkflowTask(
 	taskqueue *taskqueuepb.TaskQueue,
 	workflowTaskScheduleToStartTimeout time.Duration,
 	directive *taskqueuespb.TaskVersionDirective,
+	transactionPolicy workflow.TransactionPolicy,
 ) error {
 	var sst *durationpb.Duration
 	if workflowTaskScheduleToStartTimeout > 0 {
 		sst = durationpb.New(workflowTaskScheduleToStartTimeout)
 	}
-	_, err := t.matchingRawClient.AddWorkflowTask(ctx, &matchingservice.AddWorkflowTaskRequest{
+	resp, err := t.matchingRawClient.AddWorkflowTask(ctx, &matchingservice.AddWorkflowTaskRequest{
 		NamespaceId: task.NamespaceID,
 		Execution: &commonpb.WorkflowExecution{
 			WorkflowId: task.WorkflowID,
@@ -172,7 +193,25 @@ func (t *transferQueueTaskExecutorBase) pushWorkflowTask(
 		tasks.InitializeLogger(task, t.logger).Error("Matching returned not found error for AddWorkflowTask", tag.Error(err))
 	}
 
-	return err
+	if err != nil {
+		return err
+	}
+
+	if directive.GetUseAssignmentRules() == nil {
+		// assignment rules are not used, so no need to update MS
+		return nil
+	}
+
+	return initializeWorkflowAssignedBuildId(
+		ctx,
+		task,
+		resp.AssignedBuildId,
+		t.shardContext,
+		transactionPolicy,
+		t.cache,
+		t.metricHandler,
+		t.logger,
+	)
 }
 
 func (t *transferQueueTaskExecutorBase) processDeleteExecutionTask(
@@ -203,7 +242,7 @@ func (t *transferQueueTaskExecutorBase) deleteExecution(
 		t.shardContext,
 		namespace.ID(task.GetNamespaceID()),
 		&workflowExecution,
-		workflow.LockPriorityLow,
+		locks.PriorityLow,
 	)
 	if err != nil {
 		return err
@@ -224,8 +263,9 @@ func (t *transferQueueTaskExecutorBase) deleteExecution(
 	// ensureNoPendingCloseTask flag is set iff we're running in the active cluster, and we aren't processing the
 	// CloseExecutionTask from within this same goroutine.
 	if ensureNoPendingCloseTask {
-		// Unfortunately, queue states/ack levels are updated with delay (default 30s), therefore this could fail if the
-		// workflow was closed before the queue state/ack levels were updated, so we return a retryable error.
+		// Unfortunately, queue states/ack levels are updated with delay ("history.transferProcessorUpdateAckInterval", default 30s),
+		// therefore this could fail if the workflow was closed before the queue state/ack levels were updated,
+		// so we return a retryable error.
 		if t.isCloseExecutionTaskPending(mutableState, weCtx) {
 			return consts.ErrDependencyTaskNotCompleted
 		}
@@ -234,12 +274,17 @@ func (t *transferQueueTaskExecutorBase) deleteExecution(
 	// If task version is EmptyVersion it means "don't check task version".
 	// This can happen when task was created from explicit user API call.
 	// Or the namespace is a local namespace which will not have version conflict.
-	if task.GetVersion() != common.EmptyVersion {
-		lastWriteVersion, err := mutableState.GetLastWriteVersion()
+	taskVersion := common.EmptyVersion
+	if taskWithVersion, ok := task.(tasks.HasVersion); ok {
+		taskVersion = taskWithVersion.GetVersion()
+	}
+
+	if taskVersion != common.EmptyVersion {
+		closeVersion, err := mutableState.GetCloseVersion()
 		if err != nil {
 			return err
 		}
-		err = CheckTaskVersion(t.shardContext, t.logger, mutableState.GetNamespaceEntry(), lastWriteVersion, task.GetVersion(), task)
+		err = CheckTaskVersion(t.shardContext, t.logger, mutableState.GetNamespaceEntry(), closeVersion, taskVersion, task)
 		if err != nil {
 			return err
 		}

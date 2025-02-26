@@ -25,8 +25,7 @@
 package history
 
 import (
-	"go.uber.org/fx"
-
+	"go.opentelemetry.io/otel/trace"
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/cluster"
 	"go.temporal.io/server/common/log"
@@ -34,10 +33,12 @@ import (
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
 	ctasks "go.temporal.io/server/common/tasks"
+	"go.temporal.io/server/common/telemetry"
 	"go.temporal.io/server/service/history/configs"
 	"go.temporal.io/server/service/history/queues"
 	"go.temporal.io/server/service/history/shard"
 	wcache "go.temporal.io/server/service/history/workflow/cache"
+	"go.uber.org/fx"
 )
 
 type (
@@ -49,6 +50,7 @@ type (
 		Config            *configs.Config
 		TimeSource        clock.TimeSource
 		MetricsHandler    metrics.Handler
+		TracerProvider    trace.TracerProvider
 		Logger            log.SnTaggedLogger
 
 		ExecutorWrapper queues.ExecutorWrapper `optional:"true"`
@@ -62,6 +64,7 @@ type (
 		clusterMetadata   cluster.Metadata
 		timeSource        clock.TimeSource
 		metricsHandler    metrics.Handler
+		tracer            trace.Tracer
 		logger            log.SnTaggedLogger
 
 		executorWrapper queues.ExecutorWrapper
@@ -89,6 +92,7 @@ func NewMemoryScheduledQueueFactory(
 		clusterMetadata:   params.ClusterMetadata,
 		timeSource:        params.TimeSource,
 		metricsHandler:    metricsHandler,
+		tracer:            params.TracerProvider.Tracer(telemetry.ComponentQueueMemory),
 		logger:            logger,
 		executorWrapper:   params.ExecutorWrapper,
 	}
@@ -130,6 +134,7 @@ func (f *memoryScheduledQueueFactory) CreateQueue(
 		f.clusterMetadata,
 		f.timeSource,
 		f.metricsHandler,
+		f.tracer,
 		f.logger,
 	)
 }

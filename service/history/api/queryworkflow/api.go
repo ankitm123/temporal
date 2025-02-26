@@ -32,18 +32,17 @@ import (
 	querypb "go.temporal.io/api/query/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
-
-	"go.temporal.io/server/common/log/tag"
-	"go.temporal.io/server/common/worker_versioning"
-
 	"go.temporal.io/server/api/historyservice/v1"
 	"go.temporal.io/server/api/matchingservice/v1"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/definition"
+	"go.temporal.io/server/common/locks"
+	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/primitives/timestamp"
 	"go.temporal.io/server/common/rpc"
+	"go.temporal.io/server/common/worker_versioning"
 	"go.temporal.io/server/service/history/api"
 	"go.temporal.io/server/service/history/api/resetstickytaskqueue"
 	"go.temporal.io/server/service/history/consts"
@@ -78,7 +77,7 @@ func Invoke(
 			ctx,
 			request.NamespaceId,
 			request.Request.Execution.WorkflowId,
-			workflow.LockPriorityHigh,
+			locks.PriorityHigh,
 		)
 		if err != nil {
 			return nil, err
@@ -92,17 +91,21 @@ func Invoke(
 	workflowLease, err := workflowConsistencyChecker.GetWorkflowLease(
 		ctx,
 		nil,
-		api.BypassMutableStateConsistencyPredicate,
 		workflowKey,
-		workflow.LockPriorityHigh,
+		locks.PriorityHigh,
 	)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { workflowLease.GetReleaseFn()(retError) }()
+	defer func() {
+		// Do not clear mutable state when query failed. Clear mutable state will fail other buffered pending queries.
+		// Note: QueryWorkflow should not alter mutable state, so it is safe to ignore error and not clear ms.
+		workflowLease.GetReleaseFn()(nil)
+	}()
 
 	req := request.GetRequest()
 	_, mutableStateStatus := workflowLease.GetMutableState().GetWorkflowStateStatus()
+	scope = scope.WithTags(metrics.StringTag("workflow_status", mutableStateStatus.String()))
 	if mutableStateStatus != enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING && req.QueryRejectCondition != enumspb.QUERY_REJECT_CONDITION_NONE {
 		notOpenReject := req.GetQueryRejectCondition() == enumspb.QUERY_REJECT_CONDITION_NOT_OPEN
 		notCompletedCleanlyReject := req.GetQueryRejectCondition() == enumspb.QUERY_REJECT_CONDITION_NOT_COMPLETED_CLEANLY && mutableStateStatus != enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED
@@ -118,15 +121,22 @@ func Invoke(
 	}
 
 	mutableState := workflowLease.GetMutableState()
-	if !mutableState.HadOrHasWorkflowTask() {
-		// workflow has no workflow task ever scheduled, this usually is due to firstWorkflowTaskBackoff (cron / retry)
-		// in this case, don't buffer the query, because it is almost certain the query will time out.
-		return nil, consts.ErrWorkflowTaskNotScheduled
-	}
-
-	if !mutableState.IsWorkflowExecutionRunning() && mutableState.GetLastWorkflowTaskStartedEventID() == common.EmptyEventID {
+	if !mutableState.IsWorkflowExecutionRunning() && !mutableState.HasCompletedAnyWorkflowTask() {
 		// Workflow was closed before WorkflowTaskStarted event. In this case query will fail.
 		return nil, consts.ErrWorkflowClosedBeforeWorkflowTaskStarted
+	}
+
+	if !mutableState.HadOrHasWorkflowTask() {
+		// Workflow has no workflow task scheduled.
+		// This can be due to firstWorkflowTaskBackoff (cron / retry)
+		// In this case, check if query can wait.
+		queryWillTimeout, err := queryWillTimeoutsBeforeFirstWorkflowTaskStart(ctx, mutableState)
+		if err != nil {
+			return nil, err
+		}
+		if queryWillTimeout {
+			return nil, consts.ErrWorkflowTaskNotScheduled
+		}
 	}
 
 	if mutableState.GetExecutionInfo().WorkflowTaskAttempt >= failQueryWorkflowTaskAttemptCount {
@@ -147,7 +157,7 @@ func Invoke(
 	// is used to determine if a query can be safely dispatched directly through matching or must be dispatched on a workflow task.
 	//
 	// Precondition to dispatch query directly to matching is workflow has at least one WorkflowTaskStarted event. Otherwise, sdk would panic.
-	if mutableState.GetLastWorkflowTaskStartedEventID() != common.EmptyEventID {
+	if mutableState.HasCompletedAnyWorkflowTask() {
 		// There are three cases in which a query can be dispatched directly through matching safely, without violating strong consistency level:
 		// 1. the namespace is not active, in this case history is immutable so a query dispatched at any time is consistent
 		// 2. the workflow is not running, whenever a workflow is not running dispatching query directly is consistent
@@ -207,7 +217,7 @@ func Invoke(
 					},
 				}, nil
 			case enumspb.QUERY_RESULT_TYPE_FAILED:
-				return nil, serviceerror.NewQueryFailed(result.GetErrorMessage())
+				return nil, serviceerror.NewQueryFailedWithFailure(result.GetErrorMessage(), result.GetFailure())
 			default:
 				metrics.QueryRegistryInvalidStateCount.With(scope).Record(1)
 				return nil, consts.ErrQueryEnteredInvalidState
@@ -241,6 +251,30 @@ func Invoke(
 	}
 }
 
+func queryWillTimeoutsBeforeFirstWorkflowTaskStart(
+	ctx context.Context, mutableState workflow.MutableState,
+) (bool, error) {
+	startEvent, err := mutableState.GetStartEvent(ctx)
+	if err != nil {
+		return false, err
+	}
+	startAttr := startEvent.GetWorkflowExecutionStartedEventAttributes()
+	workflowTaskBackoffDuration := timestamp.DurationValue(startAttr.GetFirstWorkflowTaskBackoff())
+
+	workflowStart := mutableState.GetExecutionState().StartTime.AsTime().UTC()
+	workflowTaskStart := workflowStart.Add(workflowTaskBackoffDuration)
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return true, nil
+	}
+	deadline = deadline.UTC()
+	if workflowTaskStart.After(deadline) {
+		return true, nil
+	}
+	return false, nil
+}
+
 func queryDirectlyThroughMatching(
 	ctx context.Context,
 	msResp *historyservice.GetMutableStateResponse,
@@ -259,8 +293,12 @@ func queryDirectlyThroughMatching(
 	}()
 
 	directive := worker_versioning.MakeDirectiveForWorkflowTask(
-		msResp.GetWorkerVersionStamp(),
-		msResp.GetPreviousStartedEventId(),
+		msResp.GetInheritedBuildId(),
+		msResp.GetAssignedBuildId(),
+		msResp.GetMostRecentWorkerVersionStamp(),
+		msResp.GetPreviousStartedEventId() != common.EmptyEventID,
+		workflow.GetEffectiveVersioningBehavior(msResp.GetVersioningInfo()),
+		workflow.GetEffectiveDeployment(msResp.GetVersioningInfo()),
 	)
 
 	if msResp.GetIsStickyTaskQueueEnabled() &&

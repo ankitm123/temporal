@@ -30,8 +30,6 @@ import (
 	"go.temporal.io/api/workflowservice/v1"
 	sdkworker "go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
-	"go.uber.org/fx"
-
 	serverClient "go.temporal.io/server/client"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/headers"
@@ -42,6 +40,7 @@ import (
 	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/resource"
 	workercommon "go.temporal.io/server/service/worker/common"
+	"go.uber.org/fx"
 )
 
 type (
@@ -60,25 +59,38 @@ type (
 		MetricsHandler            metrics.Handler
 	}
 
+	fxResult struct {
+		fx.Out
+		Component workercommon.WorkerComponent `group:"workerComponent"`
+	}
+
 	replicationWorkerComponent struct {
 		initParams
 	}
 )
 
-var Module = workercommon.AnnotateWorkerComponentProvider(newComponent)
+var Module = fx.Options(
+	fx.Provide(NewResult),
+)
 
-func newComponent(params initParams) workercommon.WorkerComponent {
-	return &replicationWorkerComponent{initParams: params}
+func NewResult(params initParams) fxResult {
+	component := &replicationWorkerComponent{
+		initParams: params,
+	}
+	return fxResult{
+		Component: component,
+	}
 }
 
 func (wc *replicationWorkerComponent) RegisterWorkflow(registry sdkworker.Registry) {
+	registry.RegisterWorkflowWithOptions(CatchupWorkflow, workflow.RegisterOptions{Name: catchupWorkflowName})
 	registry.RegisterWorkflowWithOptions(ForceReplicationWorkflow, workflow.RegisterOptions{Name: forceReplicationWorkflowName})
 	registry.RegisterWorkflowWithOptions(NamespaceHandoverWorkflow, workflow.RegisterOptions{Name: namespaceHandoverWorkflowName})
-	registry.RegisterWorkflow(ForceTaskQueueUserDataReplicationWorkflow)
+	registry.RegisterWorkflowWithOptions(ForceTaskQueueUserDataReplicationWorkflow, workflow.RegisterOptions{Name: forceTaskQueueUserDataReplicationWorkflow})
 }
 
 func (wc *replicationWorkerComponent) DedicatedWorkflowWorkerOptions() *workercommon.DedicatedWorkerOptions {
-	// use default worker
+	// Use default worker
 	return nil
 }
 

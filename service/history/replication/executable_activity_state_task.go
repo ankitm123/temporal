@@ -26,6 +26,7 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"go.temporal.io/api/serviceerror"
@@ -40,6 +41,7 @@ import (
 	"go.temporal.io/server/common/namespace"
 	serviceerrors "go.temporal.io/server/common/serviceerror"
 	ctasks "go.temporal.io/server/common/tasks"
+	"go.temporal.io/server/service/history/consts"
 )
 
 type (
@@ -66,6 +68,9 @@ func NewExecutableActivityStateTask(
 	taskCreationTime time.Time,
 	task *replicationspb.SyncActivityTaskAttributes,
 	sourceClusterName string,
+	sourceShardKey ClusterShardKey,
+	priority enumsspb.TaskPriority,
+	replicationTask *replicationspb.ReplicationTask,
 ) *ExecutableActivityStateTask {
 	return &ExecutableActivityStateTask{
 		ProcessToolBox: processToolBox,
@@ -78,38 +83,61 @@ func NewExecutableActivityStateTask(
 			taskCreationTime,
 			time.Now().UTC(),
 			sourceClusterName,
+			sourceShardKey,
+			priority,
+			replicationTask,
 		),
 		req: &historyservice.SyncActivityRequest{
-			NamespaceId:        task.NamespaceId,
-			WorkflowId:         task.WorkflowId,
-			RunId:              task.RunId,
-			Version:            task.Version,
-			ScheduledEventId:   task.ScheduledEventId,
-			ScheduledTime:      task.ScheduledTime,
-			StartedEventId:     task.StartedEventId,
-			StartedTime:        task.StartedTime,
-			LastHeartbeatTime:  task.LastHeartbeatTime,
-			Details:            task.Details,
-			Attempt:            task.Attempt,
-			LastFailure:        task.LastFailure,
-			LastWorkerIdentity: task.LastWorkerIdentity,
-			BaseExecutionInfo:  task.BaseExecutionInfo,
-			VersionHistory:     task.VersionHistory,
+			NamespaceId:                task.NamespaceId,
+			WorkflowId:                 task.WorkflowId,
+			RunId:                      task.RunId,
+			Version:                    task.Version,
+			ScheduledEventId:           task.ScheduledEventId,
+			ScheduledTime:              task.ScheduledTime,
+			StartedEventId:             task.StartedEventId,
+			StartedTime:                task.StartedTime,
+			LastHeartbeatTime:          task.LastHeartbeatTime,
+			Details:                    task.Details,
+			Attempt:                    task.Attempt,
+			LastFailure:                task.LastFailure,
+			LastWorkerIdentity:         task.LastWorkerIdentity,
+			LastStartedBuildId:         task.LastStartedBuildId,
+			LastStartedRedirectCounter: task.LastStartedRedirectCounter,
+			BaseExecutionInfo:          task.BaseExecutionInfo,
+			VersionHistory:             task.VersionHistory,
+			FirstScheduledTime:         task.FirstScheduledTime,
+			LastAttemptCompleteTime:    task.LastAttemptCompleteTime,
+			Stamp:                      task.Stamp,
+			Paused:                     task.Paused,
+			RetryInitialInterval:       task.RetryInitialInterval,
+			RetryMaximumInterval:       task.RetryMaximumInterval,
+			RetryMaximumAttempts:       task.RetryMaximumAttempts,
+			RetryBackoffCoefficient:    task.RetryBackoffCoefficient,
 		},
 
 		batchable: true,
 		activityInfos: append(make([]*historyservice.ActivitySyncInfo, 0, 1), &historyservice.ActivitySyncInfo{
-			Version:            task.Version,
-			ScheduledEventId:   task.ScheduledEventId,
-			ScheduledTime:      task.ScheduledTime,
-			StartedEventId:     task.StartedEventId,
-			StartedTime:        task.StartedTime,
-			LastHeartbeatTime:  task.LastHeartbeatTime,
-			Details:            task.Details,
-			Attempt:            task.Attempt,
-			LastFailure:        task.LastFailure,
-			LastWorkerIdentity: task.LastWorkerIdentity,
-			VersionHistory:     task.VersionHistory,
+			Version:                    task.Version,
+			ScheduledEventId:           task.ScheduledEventId,
+			ScheduledTime:              task.ScheduledTime,
+			StartedEventId:             task.StartedEventId,
+			StartedTime:                task.StartedTime,
+			LastHeartbeatTime:          task.LastHeartbeatTime,
+			Details:                    task.Details,
+			Attempt:                    task.Attempt,
+			LastFailure:                task.LastFailure,
+			LastWorkerIdentity:         task.LastWorkerIdentity,
+			VersionHistory:             task.VersionHistory,
+			LastStartedBuildId:         task.LastStartedBuildId,
+			LastStartedRedirectCounter: task.LastStartedRedirectCounter,
+			FirstScheduledTime:         task.FirstScheduledTime,
+			LastAttemptCompleteTime:    task.LastAttemptCompleteTime,
+			Stamp:                      task.Stamp,
+			Paused:                     task.Paused,
+			RetryInitialInterval:       task.RetryInitialInterval,
+			RetryMaximumInterval:       task.RetryMaximumInterval,
+			RetryMaximumAttempts:       task.RetryMaximumAttempts,
+			RetryBackoffCoefficient:    task.RetryBackoffCoefficient,
 		}),
 	}
 }
@@ -143,7 +171,7 @@ func (e *ExecutableActivityStateTask) Execute() error {
 		)
 		return nil
 	}
-	ctx, cancel := newTaskContext(namespaceName)
+	ctx, cancel := newTaskContext(namespaceName, e.Config.ReplicationTaskApplyTimeout())
 	defer cancel()
 
 	shardContext, err := e.ShardController.GetShardByNamespaceWorkflow(
@@ -170,6 +198,10 @@ func (e *ExecutableActivityStateTask) Execute() error {
 }
 
 func (e *ExecutableActivityStateTask) HandleErr(err error) error {
+	if errors.Is(err, consts.ErrDuplicate) {
+		e.MarkTaskDuplicated()
+		return nil
+	}
 	switch retryErr := err.(type) {
 	case nil, *serviceerror.NotFound:
 		return nil
@@ -181,7 +213,7 @@ func (e *ExecutableActivityStateTask) HandleErr(err error) error {
 		if nsError != nil {
 			return err
 		}
-		ctx, cancel := newTaskContext(namespaceName)
+		ctx, cancel := newTaskContext(namespaceName, e.Config.ReplicationTaskApplyTimeout())
 		defer cancel()
 
 		if doContinue, resendErr := e.Resend(
@@ -206,37 +238,19 @@ func (e *ExecutableActivityStateTask) HandleErr(err error) error {
 }
 
 func (e *ExecutableActivityStateTask) MarkPoisonPill() error {
-	shardContext, err := e.ShardController.GetShardByNamespaceWorkflow(
-		namespace.ID(e.NamespaceID),
-		e.WorkflowID,
-	)
-	if err != nil {
-		return err
+	if e.ReplicationTask().GetRawTaskInfo() == nil {
+		e.ReplicationTask().RawTaskInfo = &persistencespb.ReplicationTaskInfo{
+			NamespaceId:      e.NamespaceID,
+			WorkflowId:       e.WorkflowID,
+			RunId:            e.RunID,
+			TaskId:           e.ExecutableTask.TaskID(),
+			TaskType:         enumsspb.TASK_TYPE_REPLICATION_SYNC_ACTIVITY,
+			ScheduledEventId: e.req.ScheduledEventId,
+			Version:          e.req.Version,
+		}
 	}
 
-	// TODO: GetShardID will break GetDLQReplicationMessages we need to handle DLQ for cross shard replication.
-	replicationTaskInfo := &persistencespb.ReplicationTaskInfo{
-		NamespaceId:      e.NamespaceID,
-		WorkflowId:       e.WorkflowID,
-		RunId:            e.RunID,
-		TaskId:           e.ExecutableTask.TaskID(),
-		TaskType:         enumsspb.TASK_TYPE_REPLICATION_SYNC_ACTIVITY,
-		ScheduledEventId: e.req.ScheduledEventId,
-		Version:          e.req.Version,
-	}
-
-	e.Logger.Error("enqueue activity state replication task to DLQ",
-		tag.ShardID(shardContext.GetShardID()),
-		tag.WorkflowNamespaceID(e.NamespaceID),
-		tag.WorkflowID(e.WorkflowID),
-		tag.WorkflowRunID(e.RunID),
-		tag.TaskID(e.ExecutableTask.TaskID()),
-	)
-
-	ctx, cancel := newTaskContext(e.NamespaceID)
-	defer cancel()
-
-	return writeTaskToDLQ(ctx, e.DLQWriter, shardContext, e.SourceClusterName(), replicationTaskInfo)
+	return e.ExecutableTask.MarkPoisonPill()
 }
 
 func (e *ExecutableActivityStateTask) BatchWith(incomingTask BatchableTask) (TrackableExecutableTask, bool) {
@@ -278,4 +292,9 @@ func (e *ExecutableActivityStateTask) CanBatch() bool {
 
 func (e *ExecutableActivityStateTask) MarkUnbatchable() {
 	e.batchable = false
+}
+
+func (e *ExecutableActivityStateTask) Cancel() {
+	e.MarkUnbatchable()
+	e.ExecutableTask.Cancel()
 }

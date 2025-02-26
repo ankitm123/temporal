@@ -33,13 +33,13 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
-	"google.golang.org/protobuf/proto"
-
 	enumsspb "go.temporal.io/server/api/enums/v1"
+	historyspb "go.temporal.io/server/api/history/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	replicationspb "go.temporal.io/server/api/replication/v1"
 	"go.temporal.io/server/common/codec"
 	"go.temporal.io/server/service/history/tasks"
+	"google.golang.org/protobuf/proto"
 )
 
 type (
@@ -51,6 +51,7 @@ type (
 
 		SerializeEvent(event *historypb.HistoryEvent, encodingType enumspb.EncodingType) (*commonpb.DataBlob, error)
 		DeserializeEvent(data *commonpb.DataBlob) (*historypb.HistoryEvent, error)
+		DeserializeStrippedEvents(data *commonpb.DataBlob) ([]*historyspb.StrippedHistoryEvent, error)
 
 		SerializeClusterMetadata(icm *persistencespb.ClusterMetadata, encodingType enumspb.EncodingType) (*commonpb.DataBlob, error)
 		DeserializeClusterMetadata(data *commonpb.DataBlob) (*persistencespb.ClusterMetadata, error)
@@ -108,12 +109,15 @@ type (
 		// ParseReplicationTask is unique among these methods in that it does not serialize or deserialize a type to or
 		// from a byte array. Instead, it takes a proto and "parses" it into a more structured type.
 		ParseReplicationTask(replicationTask *persistencespb.ReplicationTaskInfo) (tasks.Task, error)
+		// ParseReplicationTaskInfo is unique among these methods in that it does not serialize or deserialize a type to or
+		// from a byte array. Instead, it takes a structured type and "parses" it into proto
+		ParseReplicationTaskInfo(task tasks.Task) (*persistencespb.ReplicationTaskInfo, error)
 
 		SerializeTask(task tasks.Task) (*commonpb.DataBlob, error)
 		DeserializeTask(category tasks.Category, blob *commonpb.DataBlob) (tasks.Task, error)
 
-		NexusIncomingServiceToBlob(service *persistencespb.NexusIncomingService, encodingType enumspb.EncodingType) (*commonpb.DataBlob, error)
-		NexusIncomingServiceFromBlob(data *commonpb.DataBlob) (*persistencespb.NexusIncomingService, error)
+		NexusEndpointToBlob(endpoint *persistencespb.NexusEndpoint, encodingType enumspb.EncodingType) (*commonpb.DataBlob, error)
+		NexusEndpointFromBlob(data *commonpb.DataBlob) (*persistencespb.NexusEndpoint, error)
 	}
 
 	// SerializationError is an error type for serialization
@@ -170,7 +174,34 @@ func (t *serializerImpl) DeserializeEvents(data *commonpb.DataBlob) ([]*historyp
 		return nil, NewUnknownEncodingTypeError(data.EncodingType.String(), enumspb.ENCODING_TYPE_PROTO3)
 	}
 	if err != nil {
-		return nil, err
+		return nil, NewDeserializationError(enumspb.ENCODING_TYPE_PROTO3, err)
+	}
+	return events.Events, nil
+}
+
+func (t *serializerImpl) DeserializeStrippedEvents(data *commonpb.DataBlob) ([]*historyspb.StrippedHistoryEvent, error) {
+	if data == nil {
+		return nil, nil
+	}
+	if len(data.Data) == 0 {
+		return nil, nil
+	}
+
+	events := &historyspb.StrippedHistoryEvents{}
+	var err error
+	//nolint:exhaustive
+	switch data.EncodingType {
+	case enumspb.ENCODING_TYPE_PROTO3:
+		// Discard unknown fields to improve performance. StrippedHistoryEvents is usually deserialized from HistoryEvent
+		// which has extra fields that are not needed for this message.
+		err = proto.UnmarshalOptions{
+			DiscardUnknown: true,
+		}.Unmarshal(data.Data, events)
+	default:
+		return nil, NewUnknownEncodingTypeError(data.EncodingType.String(), enumspb.ENCODING_TYPE_PROTO3)
+	}
+	if err != nil {
+		return nil, NewDeserializationError(enumspb.ENCODING_TYPE_PROTO3, err)
 	}
 	return events.Events, nil
 }
@@ -199,9 +230,8 @@ func (t *serializerImpl) DeserializeEvent(data *commonpb.DataBlob) (*historypb.H
 	default:
 		return nil, NewUnknownEncodingTypeError(data.EncodingType.String(), enumspb.ENCODING_TYPE_PROTO3)
 	}
-
 	if err != nil {
-		return nil, err
+		return nil, NewDeserializationError(enumspb.ENCODING_TYPE_PROTO3, err)
 	}
 
 	return event, err
@@ -232,9 +262,8 @@ func (t *serializerImpl) DeserializeClusterMetadata(data *commonpb.DataBlob) (*p
 	default:
 		return nil, NewUnknownEncodingTypeError(data.EncodingType.String(), enumspb.ENCODING_TYPE_PROTO3)
 	}
-
 	if err != nil {
-		return nil, err
+		return nil, NewSerializationError(enumspb.ENCODING_TYPE_PROTO3, err)
 	}
 
 	return cm, err
@@ -410,7 +439,15 @@ func (t *serializerImpl) WorkflowExecutionInfoToBlob(info *persistencespb.Workfl
 
 func (t *serializerImpl) WorkflowExecutionInfoFromBlob(data *commonpb.DataBlob) (*persistencespb.WorkflowExecutionInfo, error) {
 	result := &persistencespb.WorkflowExecutionInfo{}
-	return result, ProtoDecodeBlob(data, result)
+	err := ProtoDecodeBlob(data, result)
+	if err != nil {
+		return nil, err
+	}
+	// Proto serialization replaces empty maps with nils, ensure this map is never nil.
+	if result.SubStateMachinesByType == nil {
+		result.SubStateMachinesByType = make(map[string]*persistencespb.StateMachineMap)
+	}
+	return result, nil
 }
 
 func (t *serializerImpl) WorkflowExecutionStateToBlob(info *persistencespb.WorkflowExecutionState, encodingType enumspb.EncodingType) (*commonpb.DataBlob, error) {
@@ -418,8 +455,7 @@ func (t *serializerImpl) WorkflowExecutionStateToBlob(info *persistencespb.Workf
 }
 
 func (t *serializerImpl) WorkflowExecutionStateFromBlob(data *commonpb.DataBlob) (*persistencespb.WorkflowExecutionState, error) {
-	result := &persistencespb.WorkflowExecutionState{}
-	return result, ProtoDecodeBlob(data, result)
+	return WorkflowExecutionStateFromBlob(data.GetData(), data.GetEncodingType().String())
 }
 
 func (t *serializerImpl) ActivityInfoToBlob(info *persistencespb.ActivityInfo, encodingType enumspb.EncodingType) (*commonpb.DataBlob, error) {
@@ -530,12 +566,12 @@ func (t *serializerImpl) ReplicationTaskFromBlob(data *commonpb.DataBlob) (*repl
 	return result, ProtoDecodeBlob(data, result)
 }
 
-func (t *serializerImpl) NexusIncomingServiceToBlob(service *persistencespb.NexusIncomingService, encodingType enumspb.EncodingType) (*commonpb.DataBlob, error) {
-	return ProtoEncodeBlob(service, encodingType)
+func (t *serializerImpl) NexusEndpointToBlob(endpoint *persistencespb.NexusEndpoint, encodingType enumspb.EncodingType) (*commonpb.DataBlob, error) {
+	return ProtoEncodeBlob(endpoint, encodingType)
 }
 
-func (t *serializerImpl) NexusIncomingServiceFromBlob(data *commonpb.DataBlob) (*persistencespb.NexusIncomingService, error) {
-	result := &persistencespb.NexusIncomingService{}
+func (t *serializerImpl) NexusEndpointFromBlob(data *commonpb.DataBlob) (*persistencespb.NexusEndpoint, error) {
+	result := &persistencespb.NexusEndpoint{}
 	return result, ProtoDecodeBlob(data, result)
 }
 
@@ -544,15 +580,7 @@ func ProtoDecodeBlob(data *commonpb.DataBlob, result proto.Message) error {
 		// TODO: should we return nil or error?
 		return NewDeserializationError(enumspb.ENCODING_TYPE_UNSPECIFIED, errors.New("cannot decode nil"))
 	}
-
-	if data.EncodingType != enumspb.ENCODING_TYPE_PROTO3 {
-		return NewUnknownEncodingTypeError(data.EncodingType.String(), enumspb.ENCODING_TYPE_PROTO3)
-	}
-
-	if err := proto.Unmarshal(data.Data, result); err != nil {
-		return NewDeserializationError(enumspb.ENCODING_TYPE_PROTO3, err)
-	}
-	return nil
+	return Proto3Decode(data.Data, data.EncodingType, result)
 }
 
 func decodeBlob(data *commonpb.DataBlob, result proto.Message) error {
@@ -612,12 +640,5 @@ func ProtoEncodeBlob(m proto.Message, encoding enumspb.EncodingType) (*commonpb.
 			EncodingType: encoding,
 		}, nil
 	}
-
-	blob := &commonpb.DataBlob{EncodingType: enumspb.ENCODING_TYPE_PROTO3}
-	data, err := proto.Marshal(m)
-	if err != nil {
-		return nil, NewSerializationError(enumspb.ENCODING_TYPE_PROTO3, err)
-	}
-	blob.Data = data
-	return blob, nil
+	return proto3Encode(m)
 }

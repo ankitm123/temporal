@@ -28,10 +28,9 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"slices"
 
-	"go.uber.org/multierr"
-	"golang.org/x/exp/slices"
-
+	"go.opentelemetry.io/otel/trace"
 	"go.temporal.io/server/common/cluster"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/headers"
@@ -42,6 +41,8 @@ import (
 	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/resolver"
 	"go.temporal.io/server/common/resource"
+	"go.temporal.io/server/common/telemetry"
+	"go.uber.org/multierr"
 )
 
 type (
@@ -57,6 +58,7 @@ type (
 		clusterMetadata            *cluster.Config
 		persistenceFactoryProvider persistenceClient.FactoryProviderFn
 		metricsHandler             metrics.Handler
+		tracerProvider             trace.TracerProvider
 	}
 )
 
@@ -172,20 +174,20 @@ func initSystemNamespaces(
 ) error {
 	clusterName := persistenceClient.ClusterName(currentClusterName)
 	metricsHandler = metricsHandler.WithTags(metrics.ServiceNameTag(primitives.ServerService))
-	dataStoreFactory, _ := persistenceClient.DataStoreFactoryProvider(
+	dataStoreFactory := persistenceClient.DataStoreFactoryProvider(
 		clusterName,
 		persistenceServiceResolver,
 		cfg,
 		customDataStoreFactory,
 		logger,
 		metricsHandler,
+		telemetry.NoopTracerProvider,
 	)
 	factory := persistenceFactoryProvider(persistenceClient.NewFactoryParams{
 		DataStoreFactory:           dataStoreFactory,
 		Cfg:                        cfg,
 		PersistenceMaxQPS:          nil,
 		PersistenceNamespaceMaxQPS: nil,
-		EnablePriorityRateLimiting: nil,
 		ClusterName:                persistenceClient.ClusterName(currentClusterName),
 		MetricsHandler:             metricsHandler,
 		Logger:                     logger,

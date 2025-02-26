@@ -27,22 +27,27 @@ package history
 import (
 	"context"
 
-	"go.temporal.io/server/common/persistence"
-	"go.uber.org/fx"
-
+	"go.opentelemetry.io/otel/trace"
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/cluster"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/membership"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/persistence"
+	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/common/quotas"
+	"go.temporal.io/server/common/quotas/calculator"
+	"go.temporal.io/server/service/history/circuitbreakerpool"
 	"go.temporal.io/server/service/history/configs"
 	"go.temporal.io/server/service/history/queues"
+	"go.temporal.io/server/service/history/replication/eventhandler"
 	"go.temporal.io/server/service/history/shard"
 	"go.temporal.io/server/service/history/tasks"
 	wcache "go.temporal.io/server/service/history/workflow/cache"
+	"go.uber.org/fx"
 )
 
 const QueueFactoryFxGroup = "queueFactory"
@@ -70,16 +75,20 @@ type (
 		Config               *configs.Config
 		TimeSource           clock.TimeSource
 		MetricsHandler       metrics.Handler
+		TracerProvider       trace.TracerProvider
 		Logger               log.SnTaggedLogger
 		SchedulerRateLimiter queues.SchedulerRateLimiter
 		DLQWriter            *queues.DLQWriter
 		ExecutorWrapper      queues.ExecutorWrapper `optional:"true"`
+		Serializer           serialization.Serializer
+		RemoteHistoryFetcher eventhandler.HistoryPaginatedFetcher
 	}
 
 	QueueFactoryBase struct {
 		HostScheduler         queues.Scheduler
 		HostPriorityAssigner  queues.PriorityAssigner
 		HostReaderRateLimiter quotas.RequestRateLimiter
+		Tracer                trace.Tracer
 	}
 
 	QueueFactoriesLifetimeHookParams struct {
@@ -91,6 +100,7 @@ type (
 )
 
 var QueueModule = fx.Options(
+	circuitbreakerpool.Module,
 	fx.Provide(
 		QueueSchedulerRateLimiterProvider,
 		func(tqm persistence.HistoryTaskQueueManager) queues.QueueWriter {
@@ -141,15 +151,15 @@ type additionalQueueFactories struct {
 func getOptionalQueueFactories(
 	registry tasks.TaskCategoryRegistry,
 	archivalParams ArchivalQueueFactoryParams,
-	callbackParams callbackQueueFactoryParams,
+	outboundParams outboundQueueFactoryParams,
 	config *configs.Config,
 ) additionalQueueFactories {
 	factories := []QueueFactory{}
 	if _, ok := registry.GetCategoryByID(tasks.CategoryIDArchival); ok {
 		factories = append(factories, NewArchivalQueueFactory(archivalParams))
 	}
-	if _, ok := registry.GetCategoryByID(tasks.CategoryIDCallback); ok {
-		factories = append(factories, NewCallbackQueueFactory(callbackParams))
+	if config.EnableNexus() {
+		factories = append(factories, NewOutboundQueueFactory(outboundParams))
 	}
 	return additionalQueueFactories{
 		Factories: factories,
@@ -161,20 +171,28 @@ func QueueSchedulerRateLimiterProvider(
 	serviceResolver membership.ServiceResolver,
 	config *configs.Config,
 	timeSource clock.TimeSource,
+	logger log.SnTaggedLogger,
 ) (queues.SchedulerRateLimiter, error) {
 	return queues.NewPrioritySchedulerRateLimiter(
-		shard.NewOwnershipAwareNamespaceQuotaCalculator(
-			ownershipBasedQuotaScaler,
-			serviceResolver,
-			config.TaskSchedulerNamespaceMaxQPS,
-			config.TaskSchedulerGlobalNamespaceMaxQPS,
+		calculator.NewLoggedNamespaceCalculator(
+			shard.NewOwnershipAwareNamespaceQuotaCalculator(
+				ownershipBasedQuotaScaler,
+				serviceResolver,
+				config.TaskSchedulerNamespaceMaxQPS,
+				config.TaskSchedulerGlobalNamespaceMaxQPS,
+			),
+			log.With(logger, tag.ComponentTaskScheduler, tag.ScopeNamespace),
 		).GetQuota,
-		shard.NewOwnershipAwareQuotaCalculator(
-			ownershipBasedQuotaScaler,
-			serviceResolver,
-			config.TaskSchedulerMaxQPS,
-			config.TaskSchedulerGlobalMaxQPS,
+		calculator.NewLoggedCalculator(
+			shard.NewOwnershipAwareQuotaCalculator(
+				ownershipBasedQuotaScaler,
+				serviceResolver,
+				config.TaskSchedulerMaxQPS,
+				config.TaskSchedulerGlobalMaxQPS,
+			),
+			log.With(logger, tag.ComponentTaskScheduler, tag.ScopeHost),
 		).GetQuota,
+		// TODO: reuse persistence rate limit calculator in PersistenceRateLimitingParamsProvider
 		shard.NewOwnershipAwareNamespaceQuotaCalculator(
 			ownershipBasedQuotaScaler,
 			serviceResolver,
@@ -223,25 +241,13 @@ func (f *QueueFactoryBase) Stop() {
 	}
 }
 
-func NewQueueHostRateLimiter(
-	hostRPS dynamicconfig.IntPropertyFn,
-	persistenceMaxRPS dynamicconfig.IntPropertyFn,
-	persistenceMaxRPSRatio float64,
-) quotas.RateLimiter {
-	return quotas.NewDefaultOutgoingRateLimiter(
-		NewHostRateLimiterRateFn(
-			hostRPS,
-			persistenceMaxRPS,
-			persistenceMaxRPSRatio,
-		),
-	)
-}
-
 func NewHostRateLimiterRateFn(
 	hostRPS dynamicconfig.IntPropertyFn,
 	persistenceMaxRPS dynamicconfig.IntPropertyFn,
 	persistenceMaxRPSRatio float64,
 ) quotas.RateFn {
+	// TODO: reuse persistence rate limit calculator in PersistenceRateLimitingParamsProvider
+
 	return func() float64 {
 		if maxPollHostRps := hostRPS(); maxPollHostRps > 0 {
 			return float64(maxPollHostRps)

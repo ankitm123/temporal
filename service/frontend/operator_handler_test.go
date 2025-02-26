@@ -31,7 +31,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -41,9 +40,6 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
-	"golang.org/x/exp/maps"
-	"google.golang.org/grpc/health"
-
 	"go.temporal.io/server/api/adminservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common/cluster"
@@ -59,6 +55,10 @@ import (
 	"go.temporal.io/server/common/testing/mocksdk"
 	"go.temporal.io/server/service/worker/addsearchattributes"
 	"go.temporal.io/server/service/worker/deletenamespace"
+	delnserrors "go.temporal.io/server/service/worker/deletenamespace/errors"
+	"go.uber.org/mock/gomock"
+	expmaps "golang.org/x/exp/maps"
+	"google.golang.org/grpc/health"
 )
 
 var (
@@ -71,8 +71,9 @@ type (
 		suite.Suite
 		*require.Assertions
 
-		controller   *gomock.Controller
-		mockResource *resourcetest.Test
+		controller                      *gomock.Controller
+		mockResource                    *resourcetest.Test
+		nexusEndpointPersistenceManager *persistence.MockNexusEndpointManager
 
 		handler *OperatorHandlerImpl
 	}
@@ -89,6 +90,15 @@ func (s *operatorHandlerSuite) SetupTest() {
 	s.controller = gomock.NewController(s.T())
 	s.mockResource = resourcetest.NewTest(s.controller, primitives.FrontendService)
 	s.mockResource.ClusterMetadata.EXPECT().GetCurrentClusterName().Return(uuid.New()).AnyTimes()
+	s.nexusEndpointPersistenceManager = persistence.NewMockNexusEndpointManager(s.controller)
+
+	endpointClient := newNexusEndpointClient(
+		newNexusEndpointClientConfig(dynamicconfig.NewNoopCollection()),
+		s.mockResource.NamespaceCache,
+		s.mockResource.MatchingClient,
+		s.nexusEndpointPersistenceManager,
+		s.mockResource.Logger,
+	)
 
 	args := NewOperatorHandlerImplArgs{
 		&Config{NumHistoryShards: 4},
@@ -103,6 +113,8 @@ func (s *operatorHandlerSuite) SetupTest() {
 		s.mockResource.GetClusterMetadataManager(),
 		s.mockResource.GetClusterMetadata(),
 		s.mockResource.GetClientFactory(),
+		s.mockResource.NamespaceCache,
+		endpointClient,
 	}
 	s.handler = NewOperatorHandlerImpl(args)
 	s.handler.Start()
@@ -230,6 +242,7 @@ func (s *operatorHandlerSuite) Test_AddSearchAttributes_DualVisibility() {
 		mockVisManager1,
 		mockVisManager2,
 		mockManagerSelector,
+		dynamicconfig.GetBoolPropertyFn(false),
 	)
 	s.handler.visibilityMgr = mockDualVisManager
 
@@ -724,7 +737,7 @@ func (s *operatorHandlerSuite) Test_AddSearchAttributesSQL() {
 			},
 			describeNamespaceCalled: true,
 			describeNamespaceErr:    errors.New("mock error describe namespace"),
-			expectedErrMsg:          fmt.Sprintf(errUnableToGetNamespaceInfoMessage, testNamespace),
+			expectedErrMsg:          fmt.Sprintf(errUnableToGetNamespaceInfoMessage, testNamespace, "mock error describe namespace"),
 		},
 		{
 			name: "fail: too many search attributes",
@@ -806,7 +819,7 @@ func (s *operatorHandlerSuite) Test_AddSearchAttributesSQL() {
 						opts ...any,
 					) (*workflowservice.UpdateNamespaceResponse, error) {
 						s.Len(r.Config.CustomSearchAttributeAliases, len(tc.customSearchAttributesToAdd))
-						aliases := maps.Values(r.Config.CustomSearchAttributeAliases)
+						aliases := expmaps.Values(r.Config.CustomSearchAttributeAliases)
 						for _, saName := range tc.customSearchAttributesToAdd {
 							s.Contains(aliases, saName)
 						}
@@ -1114,36 +1127,10 @@ func (s *operatorHandlerSuite) Test_DeleteNamespace() {
 	handler := s.handler
 	ctx := context.Background()
 
-	type test struct {
-		Name     string
-		Request  *operatorservice.DeleteNamespaceRequest
-		Expected error
-	}
-	// request validation tests
-	testCases := []test{
-		{
-			Name:     "nil request",
-			Request:  nil,
-			Expected: &serviceerror.InvalidArgument{Message: "Request is nil."},
-		},
-		{
-			Name:     "system namespace",
-			Request:  &operatorservice.DeleteNamespaceRequest{Namespace: "temporal-system"},
-			Expected: &serviceerror.InvalidArgument{Message: "Unable to delete system namespace."},
-		},
-		{
-			Name:     "system namespace id",
-			Request:  &operatorservice.DeleteNamespaceRequest{NamespaceId: "32049b68-7872-4094-8e63-d0dd59896a83"},
-			Expected: &serviceerror.InvalidArgument{Message: "Unable to delete system namespace."},
-		},
-	}
-	for _, testCase := range testCases {
-		s.T().Run(testCase.Name, func(t *testing.T) {
-			resp, err := handler.DeleteNamespace(ctx, testCase.Request)
-			s.Equal(testCase.Expected, err)
-			s.Nil(resp)
-		})
-	}
+	// Nil request.
+	resp, err := handler.DeleteNamespace(ctx, nil)
+	s.Equal(&serviceerror.InvalidArgument{Message: "Request is nil."}, err)
+	s.Nil(resp)
 
 	mockSdkClient := mocksdk.NewMockClient(s.controller)
 	s.mockResource.SDKClientFactory.EXPECT().GetSystemClient().Return(mockSdkClient).AnyTimes()
@@ -1158,7 +1145,7 @@ func (s *operatorHandlerSuite) Test_DeleteNamespace() {
 
 	// Start workflow failed.
 	mockSdkClient.EXPECT().ExecuteWorkflow(gomock.Any(), gomock.Any(), "temporal-sys-delete-namespace-workflow", gomock.Any()).Return(nil, errors.New("start failed"))
-	resp, err := handler.DeleteNamespace(ctx, &operatorservice.DeleteNamespaceRequest{
+	resp, err = handler.DeleteNamespace(ctx, &operatorservice.DeleteNamespaceRequest{
 		Namespace: "test-namespace",
 	})
 	s.Error(err)
@@ -1170,13 +1157,47 @@ func (s *operatorHandlerSuite) Test_DeleteNamespace() {
 	mockRun.EXPECT().Get(gomock.Any(), gomock.Any()).Return(errors.New("workflow failed"))
 	const RunId = "9a9f668a-58b1-427e-bed6-bf1401049f7d"
 	mockRun.EXPECT().GetRunID().Return(RunId)
+	mockRun.EXPECT().GetID().Return("test-workflow-id")
 	mockSdkClient.EXPECT().ExecuteWorkflow(gomock.Any(), gomock.Any(), "temporal-sys-delete-namespace-workflow", gomock.Any()).Return(mockRun, nil)
 	resp, err = handler.DeleteNamespace(ctx, &operatorservice.DeleteNamespaceRequest{
 		Namespace: "test-namespace",
 	})
 	s.Error(err)
-	s.Equal(RunId, err.(*serviceerror.SystemWorkflow).WorkflowExecution.RunId)
-	s.Equal(fmt.Sprintf("System Workflow with WorkflowId temporal-sys-delete-namespace-workflow and RunId %s returned an error: workflow failed", RunId), err.Error())
+	var sysWfErr *serviceerror.SystemWorkflow
+	s.ErrorAs(err, &sysWfErr)
+	s.Equal(RunId, sysWfErr.WorkflowExecution.RunId)
+	s.Equal(fmt.Sprintf("System Workflow with WorkflowId test-workflow-id and RunId %s returned an error: workflow failed", RunId), err.Error())
+	s.Nil(resp)
+
+	// Workflow failed because of validation error (an attempt to delete system namespace).
+	mockRun2 := mocksdk.NewMockWorkflowRun(s.controller)
+	mockRun2.EXPECT().Get(gomock.Any(), gomock.Any()).Return(delnserrors.NewFailedPrecondition("unable to delete system namespace", nil))
+	mockRun2.EXPECT().GetRunID().Return(RunId)
+	mockRun2.EXPECT().GetID().Return("test-workflow-id")
+	mockSdkClient.EXPECT().ExecuteWorkflow(gomock.Any(), gomock.Any(), "temporal-sys-delete-namespace-workflow", gomock.Any()).Return(mockRun2, nil)
+	resp, err = handler.DeleteNamespace(ctx, &operatorservice.DeleteNamespaceRequest{
+		Namespace: "temporal-system",
+	})
+	s.Error(err)
+	var failedPreconditionErr *serviceerror.FailedPrecondition
+	s.ErrorAs(err, &failedPreconditionErr)
+	s.Equal("unable to delete system namespace", failedPreconditionErr.Error())
+	s.Nil(resp)
+
+	// Workflow failed because of validation error (an attempt to delete system namespace).
+	mockRun3 := mocksdk.NewMockWorkflowRun(s.controller)
+	mockRun3.EXPECT().Get(gomock.Any(), gomock.Any()).Return(delnserrors.NewInvalidArgument("only one of namespace or namespace ID must be set", nil))
+	mockRun3.EXPECT().GetRunID().Return(RunId)
+	mockRun3.EXPECT().GetID().Return("test-workflow-id")
+	mockSdkClient.EXPECT().ExecuteWorkflow(gomock.Any(), gomock.Any(), "temporal-sys-delete-namespace-workflow", gomock.Any()).Return(mockRun3, nil)
+	resp, err = handler.DeleteNamespace(ctx, &operatorservice.DeleteNamespaceRequest{
+		Namespace:   "temporal-system",
+		NamespaceId: "c13c01a7-3887-4eda-ba4b-9a07a6359e7e",
+	})
+	s.Error(err)
+	var invalidArgErr *serviceerror.InvalidArgument
+	s.ErrorAs(err, &invalidArgErr)
+	s.Equal("only one of namespace or namespace ID must be set", invalidArgErr.Error())
 	s.Nil(resp)
 
 	// Success case.
@@ -1238,6 +1259,7 @@ func (s *operatorHandlerSuite) Test_RemoveRemoteCluster_Error() {
 
 func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_RecordFound_Success() {
 	var rpcAddress = uuid.New()
+	var httpAddress = uuid.New()
 	var clusterName = uuid.New()
 	var clusterId = uuid.New()
 	var recordVersion int64 = 5
@@ -1252,6 +1274,7 @@ func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_RecordFound_Success
 			ClusterId:                clusterId,
 			ClusterName:              clusterName,
 			HistoryShardCount:        4,
+			HttpAddress:              httpAddress,
 			FailoverVersionIncrement: 0,
 			InitialFailoverVersion:   0,
 			IsGlobalNamespaceEnabled: true,
@@ -1266,18 +1289,22 @@ func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_RecordFound_Success
 			HistoryShardCount:        4,
 			ClusterId:                clusterId,
 			ClusterAddress:           rpcAddress,
+			HttpAddress:              httpAddress,
 			FailoverVersionIncrement: 0,
 			InitialFailoverVersion:   0,
 			IsGlobalNamespaceEnabled: true,
 		},
 		Version: recordVersion,
 	}).Return(true, nil)
-	_, err := s.handler.AddOrUpdateRemoteCluster(context.Background(), &operatorservice.AddOrUpdateRemoteClusterRequest{FrontendAddress: rpcAddress})
+	_, err := s.handler.AddOrUpdateRemoteCluster(context.Background(), &operatorservice.AddOrUpdateRemoteClusterRequest{
+		FrontendAddress: rpcAddress,
+	})
 	s.NoError(err)
 }
 
 func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_RecordNotFound_Success() {
 	var rpcAddress = uuid.New()
+	var httpAddress = uuid.New()
 	var clusterName = uuid.New()
 	var clusterId = uuid.New()
 
@@ -1291,6 +1318,7 @@ func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_RecordNotFound_Succ
 			ClusterId:                clusterId,
 			ClusterName:              clusterName,
 			HistoryShardCount:        4,
+			HttpAddress:              httpAddress,
 			FailoverVersionIncrement: 0,
 			InitialFailoverVersion:   0,
 			IsGlobalNamespaceEnabled: true,
@@ -1305,13 +1333,16 @@ func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_RecordNotFound_Succ
 			HistoryShardCount:        4,
 			ClusterId:                clusterId,
 			ClusterAddress:           rpcAddress,
+			HttpAddress:              httpAddress,
 			FailoverVersionIncrement: 0,
 			InitialFailoverVersion:   0,
 			IsGlobalNamespaceEnabled: true,
 		},
 		Version: 0,
 	}).Return(true, nil)
-	_, err := s.handler.AddOrUpdateRemoteCluster(context.Background(), &operatorservice.AddOrUpdateRemoteClusterRequest{FrontendAddress: rpcAddress})
+	_, err := s.handler.AddOrUpdateRemoteCluster(context.Background(), &operatorservice.AddOrUpdateRemoteClusterRequest{
+		FrontendAddress: rpcAddress,
+	})
 	s.NoError(err)
 }
 
@@ -1384,6 +1415,7 @@ func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_ValidationError_Sha
 
 func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_ShardCount_Multiple() {
 	var rpcAddress = uuid.New()
+	var httpAddress = uuid.New()
 	var clusterName = uuid.New()
 	var clusterId = uuid.New()
 	var recordVersion int64 = 5
@@ -1398,6 +1430,7 @@ func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_ShardCount_Multiple
 			ClusterId:                clusterId,
 			ClusterName:              clusterName,
 			HistoryShardCount:        16,
+			HttpAddress:              httpAddress,
 			FailoverVersionIncrement: 0,
 			InitialFailoverVersion:   0,
 			IsGlobalNamespaceEnabled: true,
@@ -1412,13 +1445,16 @@ func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_ShardCount_Multiple
 			HistoryShardCount:        16,
 			ClusterId:                clusterId,
 			ClusterAddress:           rpcAddress,
+			HttpAddress:              httpAddress,
 			FailoverVersionIncrement: 0,
 			InitialFailoverVersion:   0,
 			IsGlobalNamespaceEnabled: true,
 		},
 		Version: recordVersion,
 	}).Return(true, nil)
-	_, err := s.handler.AddOrUpdateRemoteCluster(context.Background(), &operatorservice.AddOrUpdateRemoteClusterRequest{FrontendAddress: rpcAddress})
+	_, err := s.handler.AddOrUpdateRemoteCluster(context.Background(), &operatorservice.AddOrUpdateRemoteClusterRequest{
+		FrontendAddress: rpcAddress,
+	})
 	s.NoError(err)
 }
 
@@ -1514,6 +1550,7 @@ func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_GetClusterMetadata_
 
 func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_SaveClusterMetadata_Error() {
 	var rpcAddress = uuid.New()
+	var httpAddress = uuid.New()
 	var clusterName = uuid.New()
 	var clusterId = uuid.New()
 
@@ -1527,6 +1564,7 @@ func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_SaveClusterMetadata
 			ClusterId:                clusterId,
 			ClusterName:              clusterName,
 			HistoryShardCount:        4,
+			HttpAddress:              httpAddress,
 			FailoverVersionIncrement: 0,
 			InitialFailoverVersion:   0,
 			IsGlobalNamespaceEnabled: true,
@@ -1541,18 +1579,22 @@ func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_SaveClusterMetadata
 			HistoryShardCount:        4,
 			ClusterId:                clusterId,
 			ClusterAddress:           rpcAddress,
+			HttpAddress:              httpAddress,
 			FailoverVersionIncrement: 0,
 			InitialFailoverVersion:   0,
 			IsGlobalNamespaceEnabled: true,
 		},
 		Version: 0,
 	}).Return(false, fmt.Errorf("test error"))
-	_, err := s.handler.AddOrUpdateRemoteCluster(context.Background(), &operatorservice.AddOrUpdateRemoteClusterRequest{FrontendAddress: rpcAddress})
+	_, err := s.handler.AddOrUpdateRemoteCluster(context.Background(), &operatorservice.AddOrUpdateRemoteClusterRequest{
+		FrontendAddress: rpcAddress,
+	})
 	s.Error(err)
 }
 
 func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_SaveClusterMetadata_NotApplied_Error() {
 	var rpcAddress = uuid.New()
+	var httpAddress = uuid.New()
 	var clusterName = uuid.New()
 	var clusterId = uuid.New()
 
@@ -1566,6 +1608,7 @@ func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_SaveClusterMetadata
 			ClusterId:                clusterId,
 			ClusterName:              clusterName,
 			HistoryShardCount:        4,
+			HttpAddress:              httpAddress,
 			FailoverVersionIncrement: 0,
 			InitialFailoverVersion:   0,
 			IsGlobalNamespaceEnabled: true,
@@ -1580,13 +1623,16 @@ func (s *operatorHandlerSuite) Test_AddOrUpdateRemoteCluster_SaveClusterMetadata
 			HistoryShardCount:        4,
 			ClusterId:                clusterId,
 			ClusterAddress:           rpcAddress,
+			HttpAddress:              httpAddress,
 			FailoverVersionIncrement: 0,
 			InitialFailoverVersion:   0,
 			IsGlobalNamespaceEnabled: true,
 		},
 		Version: 0,
 	}).Return(false, nil)
-	_, err := s.handler.AddOrUpdateRemoteCluster(context.Background(), &operatorservice.AddOrUpdateRemoteClusterRequest{FrontendAddress: rpcAddress})
+	_, err := s.handler.AddOrUpdateRemoteCluster(context.Background(), &operatorservice.AddOrUpdateRemoteClusterRequest{
+		FrontendAddress: rpcAddress,
+	})
 	s.Error(err)
 	s.IsType(&serviceerror.InvalidArgument{}, err)
 }

@@ -32,13 +32,13 @@ import (
 	"time"
 
 	"github.com/temporalio/sqlparser"
-
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
 	"go.temporal.io/server/common/persistence/visibility/store/query"
-	"go.temporal.io/server/common/primitives/timestamp"
+	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/searchattribute"
+	"go.temporal.io/server/common/sqlquery"
 )
 
 type (
@@ -381,7 +381,7 @@ func (c *QueryConverter) convertComparisonExpr(exprRef *sqlparser.Expr) error {
 		return err
 	}
 
-	err = c.convertValueExpr(&expr.Right, saColNameExpr.alias, saColNameExpr.valueType)
+	err = c.convertValueExpr(&expr.Right, saColNameExpr.alias, saColNameExpr.fieldName, saColNameExpr.valueType)
 	if err != nil {
 		return err
 	}
@@ -444,11 +444,11 @@ func (c *QueryConverter) convertRangeCond(exprRef *sqlparser.Expr) error {
 			saColNameExpr.valueType.String(),
 		)
 	}
-	err = c.convertValueExpr(&expr.From, saColNameExpr.alias, saColNameExpr.valueType)
+	err = c.convertValueExpr(&expr.From, saColNameExpr.alias, saColNameExpr.fieldName, saColNameExpr.valueType)
 	if err != nil {
 		return err
 	}
-	err = c.convertValueExpr(&expr.To, saColNameExpr.alias, saColNameExpr.valueType)
+	err = c.convertValueExpr(&expr.To, saColNameExpr.alias, saColNameExpr.fieldName, saColNameExpr.valueType)
 	if err != nil {
 		return err
 	}
@@ -470,13 +470,18 @@ func (c *QueryConverter) convertColName(exprRef *sqlparser.Expr) (*saColName, er
 		var err error
 		saFieldName, err = c.saMapper.GetFieldName(saAlias, c.namespaceName.String())
 		if err != nil {
-			return nil, query.NewConverterError(
-				"%s: column name '%s' is not a valid search attribute",
-				query.InvalidExpressionErrMessage,
-				saAlias,
-			)
+			if saAlias != searchattribute.ScheduleID {
+				return nil, query.NewConverterError(
+					"%s: column name '%s' is not a valid search attribute",
+					query.InvalidExpressionErrMessage,
+					saAlias,
+				)
+			}
+			// ScheduleId is a fake SA -- convert to WorkflowId
+			saFieldName = searchattribute.WorkflowID
 		}
 	}
+
 	saType, err := c.saTypeMap.GetType(saFieldName)
 	if err != nil {
 		// This should never happen since it came from mapping.
@@ -505,16 +510,22 @@ func (c *QueryConverter) convertColName(exprRef *sqlparser.Expr) (*saColName, er
 
 func (c *QueryConverter) convertValueExpr(
 	exprRef *sqlparser.Expr,
-	saName string,
+	name string,
+	saFieldName string,
 	saType enumspb.IndexedValueType,
 ) error {
 	expr := *exprRef
 	switch e := expr.(type) {
 	case *sqlparser.SQLVal:
-		value, err := c.parseSQLVal(e, saName, saType)
+		value, err := c.parseSQLVal(e, name, saType)
 		if err != nil {
 			return err
 		}
+
+		if name == searchattribute.ScheduleID && saFieldName == searchattribute.WorkflowID {
+			value = primitives.ScheduleWorkflowIDPrefix + fmt.Sprintf("%v", value)
+		}
+
 		switch v := value.(type) {
 		case string:
 			// escape strings for safety
@@ -530,7 +541,7 @@ func (c *QueryConverter) convertValueExpr(
 				"%s: unexpected value type %T for search attribute %s",
 				query.InvalidExpressionErrMessage,
 				v,
-				saName,
+				name,
 			)
 		}
 		return nil
@@ -540,7 +551,7 @@ func (c *QueryConverter) convertValueExpr(
 	case sqlparser.ValTuple:
 		// This is "in (1,2,3)" case.
 		for i := range e {
-			err := c.convertValueExpr(&e[i], saName, saType)
+			err := c.convertValueExpr(&e[i], name, saFieldName, saType)
 			if err != nil {
 				return err
 			}
@@ -569,6 +580,7 @@ func (c *QueryConverter) convertValueExpr(
 // Returns a string, an int64 or a float64 if there are no errors.
 // For datetime, converts to UTC.
 // For execution status, converts string to enum value.
+// For execution duration, converts to nanoseconds.
 func (c *QueryConverter) parseSQLVal(
 	expr *sqlparser.SQLVal,
 	saName string,
@@ -583,7 +595,7 @@ func (c *QueryConverter) parseSQLVal(
 	default:
 		sqlValue = string(expr.Val)
 	}
-	value, err := query.ParseSqlValue(sqlValue)
+	value, err := sqlquery.ParseValue(sqlValue)
 	if err != nil {
 		return nil, err
 	}
@@ -642,22 +654,12 @@ func (c *QueryConverter) parseSQLVal(
 
 	if saName == searchattribute.ExecutionDuration {
 		if durationStr, isString := value.(string); isString {
-			// To support durations passed as golang durations such as "300ms", "-1.5h" or "2h45m".
-			// Valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
-			// Custom timestamp.ParseDuration also supports "d" as additional unit for days.
-			if duration, err := timestamp.ParseDuration(durationStr); err == nil {
-				value = duration.Nanoseconds()
-			} else {
-				// To support "hh:mm:ss" durations.
-				durationNanos, err := timestamp.ParseHHMMSSDuration(durationStr)
-				var converterErr *query.ConverterError
-				if errors.As(err, &converterErr) {
-					return nil, converterErr
-				}
-				if err == nil {
-					value = durationNanos
-				}
+			duration, err := query.ParseExecutionDurationStr(durationStr)
+			if err != nil {
+				return nil, query.NewConverterError(
+					"invalid value for search attribute %s: %v (%v)", saName, value, err)
 			}
+			value = duration.Nanoseconds()
 		}
 	}
 
@@ -669,13 +671,18 @@ func (c *QueryConverter) convertIsExpr(exprRef *sqlparser.Expr) error {
 	if !ok {
 		return query.NewConverterError("`%s` is not an 'IS' expression", sqlparser.String(*exprRef))
 	}
-	_, err := c.convertColName(&expr.Expr)
+
+	colName, err := c.convertColName(&expr.Expr)
 	if err != nil {
 		return err
 	}
+
 	switch expr.Operator {
 	case sqlparser.IsNullStr, sqlparser.IsNotNullStr:
-		// no-op
+		if colName == closeTimeSaColName {
+			// avoid coalescing close time when checking for null
+			expr.Expr = closeTimeSaColName
+		}
 	default:
 		return query.NewConverterError(
 			"%s: 'IS' operator can only be used with 'NULL' or 'NOT NULL'",
