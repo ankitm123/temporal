@@ -29,14 +29,17 @@ import (
 	"errors"
 	"time"
 
+	commonpb "go.temporal.io/api/common/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
+	"go.temporal.io/api/workflowservice/v1"
+	persistencespb "go.temporal.io/server/api/persistence/v1"
 	taskqueuespb "go.temporal.io/server/api/taskqueue/v1"
-
+	"go.temporal.io/server/client"
+	"go.temporal.io/server/common"
+	"go.temporal.io/server/common/definition"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/namespace"
-	"go.temporal.io/server/common/persistence/versionhistory"
-	"go.temporal.io/server/common/worker_versioning"
 	"go.temporal.io/server/service/history/consts"
 	"go.temporal.io/server/service/history/tasks"
 	"go.temporal.io/server/service/history/workflow"
@@ -98,56 +101,89 @@ func standbyTimerTaskPostActionTaskDiscarded(
 	return consts.ErrTaskDiscarded
 }
 
-type (
-	historyResendInfo struct {
+func isWorkflowExistOnSource(
+	ctx context.Context,
+	workflowKey definition.WorkflowKey,
+	logger log.Logger,
+	currentCluster string,
+	clientBean client.Bean,
+	registry namespace.Registry,
+) bool {
+	namespaceEntry, err := registry.GetNamespaceByID(namespace.ID(workflowKey.NamespaceID))
+	if err != nil {
+		return true
+	}
+	remoteClusterName, err := getSourceClusterName(
+		currentCluster,
+		registry,
+		workflowKey.GetNamespaceID(),
+	)
+	if err != nil {
+		return true
+	}
+	_, remoteFrontend, err := clientBean.GetRemoteFrontendClient(remoteClusterName)
+	if err != nil {
+		return true
+	}
+	_, err = remoteFrontend.DescribeWorkflowExecution(ctx, &workflowservice.DescribeWorkflowExecutionRequest{
+		Namespace: namespaceEntry.Name().String(),
+		Execution: &commonpb.WorkflowExecution{
+			WorkflowId: workflowKey.GetWorkflowID(),
+			RunId:      workflowKey.GetRunID(),
+		},
+	})
+	if err != nil {
+		if common.IsNotFoundError(err) {
+			return false
+		}
+		logger.Error("Error describe mutable state from remote.",
+			tag.WorkflowNamespaceID(workflowKey.GetNamespaceID()),
+			tag.WorkflowID(workflowKey.GetWorkflowID()),
+			tag.WorkflowRunID(workflowKey.GetRunID()),
+			tag.ClusterName(remoteClusterName),
+			tag.Error(err))
+	}
+	return true
+}
 
-		// used by NDC
-		lastEventID      int64
-		lastEventVersion int64
+type (
+	executionTimerPostActionInfo struct {
+		currentRunID string
 	}
 
 	activityTaskPostActionInfo struct {
-		*historyResendInfo
-
 		taskQueue                          string
 		activityTaskScheduleToStartTimeout time.Duration
 		versionDirective                   *taskqueuespb.TaskVersionDirective
 	}
 
-	workflowTaskPostActionInfo struct {
-		*historyResendInfo
+	verifyCompletionRecordedPostActionInfo struct {
+		parentWorkflowKey *definition.WorkflowKey
+	}
 
+	workflowTaskPostActionInfo struct {
 		workflowTaskScheduleToStartTimeout time.Duration
 		taskqueue                          *taskqueuepb.TaskQueue
 		versionDirective                   *taskqueuespb.TaskVersionDirective
 	}
 )
 
-func newHistoryResendInfo(
-	lastEventID int64,
-	lastEventVersion int64,
-) *historyResendInfo {
-	return &historyResendInfo{
-		lastEventID:      lastEventID,
-		lastEventVersion: lastEventVersion,
-	}
+func newExecutionTimerPostActionInfo(
+	mutableState workflow.MutableState,
+) (*executionTimerPostActionInfo, error) {
+	return &executionTimerPostActionInfo{
+		currentRunID: mutableState.GetExecutionState().RunId,
+	}, nil
 }
 
 func newActivityTaskPostActionInfo(
 	mutableState workflow.MutableState,
-	activityScheduleToStartTimeout time.Duration,
-	useCompatibleVersion bool,
+	activityInfo *persistencespb.ActivityInfo,
 ) (*activityTaskPostActionInfo, error) {
-	resendInfo, err := getHistoryResendInfo(mutableState)
-	if err != nil {
-		return nil, err
-	}
-
-	directive := worker_versioning.MakeDirectiveForActivityTask(mutableState.GetWorkerVersionStamp(), useCompatibleVersion)
+	directive := MakeDirectiveForActivityTask(mutableState, activityInfo)
 
 	return &activityTaskPostActionInfo{
-		historyResendInfo:                  resendInfo,
-		activityTaskScheduleToStartTimeout: activityScheduleToStartTimeout,
+		activityTaskScheduleToStartTimeout: activityInfo.ScheduleToStartTimeout.AsDuration(),
 		versionDirective:                   directive,
 	}, nil
 }
@@ -156,17 +192,11 @@ func newActivityRetryTimePostActionInfo(
 	mutableState workflow.MutableState,
 	taskQueue string,
 	activityScheduleToStartTimeout time.Duration,
-	useCompatibleVersion bool,
+	activityInfo *persistencespb.ActivityInfo,
 ) (*activityTaskPostActionInfo, error) {
-	resendInfo, err := getHistoryResendInfo(mutableState)
-	if err != nil {
-		return nil, err
-	}
-
-	directive := worker_versioning.MakeDirectiveForActivityTask(mutableState.GetWorkerVersionStamp(), useCompatibleVersion)
+	directive := MakeDirectiveForActivityTask(mutableState, activityInfo)
 
 	return &activityTaskPostActionInfo{
-		historyResendInfo:                  resendInfo,
 		taskQueue:                          taskQueue,
 		activityTaskScheduleToStartTimeout: activityScheduleToStartTimeout,
 		versionDirective:                   directive,
@@ -178,69 +208,37 @@ func newWorkflowTaskPostActionInfo(
 	workflowTaskScheduleToStartTimeout time.Duration,
 	taskqueue *taskqueuepb.TaskQueue,
 ) (*workflowTaskPostActionInfo, error) {
-	resendInfo, err := getHistoryResendInfo(mutableState)
-	if err != nil {
-		return nil, err
-	}
-
-	directive := worker_versioning.MakeDirectiveForWorkflowTask(
-		mutableState.GetWorkerVersionStamp(),
-		mutableState.GetLastWorkflowTaskStartedEventID(),
-	)
+	directive := MakeDirectiveForWorkflowTask(mutableState)
 
 	return &workflowTaskPostActionInfo{
-		historyResendInfo:                  resendInfo,
 		workflowTaskScheduleToStartTimeout: workflowTaskScheduleToStartTimeout,
 		taskqueue:                          taskqueue,
 		versionDirective:                   directive,
 	}, nil
 }
 
-func getHistoryResendInfo(
-	mutableState workflow.MutableState,
-) (*historyResendInfo, error) {
-
-	currentBranch, err := versionhistory.GetCurrentVersionHistory(mutableState.GetExecutionInfo().GetVersionHistories())
-	if err != nil {
-		return nil, err
-	}
-	lastItem, err := versionhistory.GetLastVersionHistoryItem(currentBranch)
-	if err != nil {
-		return nil, err
-	}
-	return newHistoryResendInfo(lastItem.GetEventId(), lastItem.GetVersion()), nil
-}
-
 func getStandbyPostActionFn(
 	taskInfo tasks.Task,
 	standbyNow standbyCurrentTimeFn,
-	standbyTaskMissingEventsResendDelay time.Duration,
 	standbyTaskMissingEventsDiscardDelay time.Duration,
-	fetchHistoryStandbyPostActionFn standbyPostActionFn,
 	discardTaskStandbyPostActionFn standbyPostActionFn,
 ) standbyPostActionFn {
 
 	// this is for task retry, use machine time
 	now := standbyNow()
 	taskTime := taskInfo.GetVisibilityTime()
-	resendTime := taskTime.Add(standbyTaskMissingEventsResendDelay)
 	discardTime := taskTime.Add(standbyTaskMissingEventsDiscardDelay)
 
 	// now < task start time + StandbyTaskMissingEventsResendDelay
-	if now.Before(resendTime) {
-		return standbyTaskPostActionNoOp
-	}
-
-	// task start time + StandbyTaskMissingEventsResendDelay <= now < task start time + StandbyTaskMissingEventsResendDelay
 	if now.Before(discardTime) {
-		return fetchHistoryStandbyPostActionFn
+		return standbyTaskPostActionNoOp
 	}
 
 	// task start time + StandbyTaskMissingEventsResendDelay <= now
 	return discardTaskStandbyPostActionFn
 }
 
-func getRemoteClusterName(
+func getSourceClusterName(
 	currentCluster string,
 	registry namespace.Registry,
 	namespaceID string,

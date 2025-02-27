@@ -31,9 +31,9 @@ import (
 	"fmt"
 
 	"go.temporal.io/api/serviceerror"
-
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/persistence"
+	"go.temporal.io/server/service/history/consts"
 	"go.temporal.io/server/service/history/shard"
 	"go.temporal.io/server/service/history/workflow"
 )
@@ -88,9 +88,12 @@ func (r *nDCTransactionMgrForNewWorkflowImpl) dispatchForNewWorkflow(
 		namespaceID,
 		workflowID,
 	)
-	if err != nil || currentRunID == targetRunID {
+	if err != nil {
 		// error out or workflow already created
 		return err
+	}
+	if currentRunID == targetRunID {
+		return consts.ErrDuplicate
 	}
 
 	if currentRunID == "" {
@@ -221,19 +224,40 @@ func (r *nDCTransactionMgrForNewWorkflowImpl) createAsZombie(
 	currentWorkflow.GetReleaseFn()(nil)
 	currentWorkflow = nil
 
-	targetWorkflowSnapshot, targetWorkflowEventsSeq, err := targetWorkflow.GetMutableState().CloseTransactionAsSnapshot(
+	ms := targetWorkflow.GetMutableState()
+
+	eventReapplyCandidates := ms.GetReapplyCandidateEvents()
+	targetWorkflowSnapshot, targetWorkflowEventsSeq, err := ms.CloseTransactionAsSnapshot(
 		targetWorkflowPolicy,
 	)
 	if err != nil {
 		return err
 	}
 
-	if err := targetWorkflow.GetContext().ReapplyEvents(
-		ctx,
-		r.shardContext,
-		targetWorkflowEventsSeq,
-	); err != nil {
-		return err
+	if len(targetWorkflowEventsSeq) != 0 {
+		if err := targetWorkflow.GetContext().ReapplyEvents(
+			ctx,
+			r.shardContext,
+			targetWorkflowEventsSeq,
+		); err != nil {
+			return err
+		}
+	} else if len(eventReapplyCandidates) != 0 {
+		eventsToApply := []*persistence.WorkflowEvents{
+			{
+				NamespaceID: ms.GetExecutionInfo().NamespaceId,
+				WorkflowID:  ms.GetExecutionInfo().WorkflowId,
+				RunID:       ms.GetExecutionState().RunId,
+				Events:      eventReapplyCandidates,
+			},
+		}
+		if err := targetWorkflow.GetContext().ReapplyEvents(
+			ctx,
+			r.shardContext,
+			eventsToApply,
+		); err != nil {
+			return err
+		}
 	}
 
 	// target workflow is in zombie state, no need to update current record.
@@ -246,7 +270,7 @@ func (r *nDCTransactionMgrForNewWorkflowImpl) createAsZombie(
 		createMode,
 		prevRunID,
 		prevLastWriteVersion,
-		targetWorkflow.GetMutableState(),
+		ms,
 		targetWorkflowSnapshot,
 		targetWorkflowEventsSeq,
 	)

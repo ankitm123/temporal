@@ -27,15 +27,14 @@ package temporal
 import (
 	"fmt"
 	"net/http"
-
-	"golang.org/x/exp/slices"
-	"google.golang.org/grpc"
+	"slices"
 
 	"go.temporal.io/server/client"
 	"go.temporal.io/server/common/authorization"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/membership/static"
 	"go.temporal.io/server/common/metrics"
 	persistenceClient "go.temporal.io/server/common/persistence/client"
 	"go.temporal.io/server/common/persistence/visibility"
@@ -43,6 +42,7 @@ import (
 	"go.temporal.io/server/common/resolver"
 	"go.temporal.io/server/common/rpc/encryption"
 	"go.temporal.io/server/common/searchattribute"
+	"google.golang.org/grpc"
 )
 
 type (
@@ -54,10 +54,11 @@ type (
 	serverOptions struct {
 		serviceNames map[primitives.ServiceName]struct{}
 
-		config    *config.Config
-		configDir string
-		env       string
-		zone      string
+		config         *config.Config
+		configDir      string
+		env            string
+		zone           string
+		hostsByService map[primitives.ServiceName]static.Hosts
 
 		startupSynchronizationMode synchronizationModeParams
 

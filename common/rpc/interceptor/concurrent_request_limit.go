@@ -32,12 +32,12 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
-	"go.temporal.io/server/common/quotas"
-	"google.golang.org/grpc"
-
 	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/quotas/calculator"
+	"google.golang.org/grpc"
 )
 
 type (
@@ -46,7 +46,7 @@ type (
 	ConcurrentRequestLimitInterceptor struct {
 		namespaceRegistry namespace.Registry
 		logger            log.Logger
-		quotaCalculator   quotas.ClusterAwareNamespaceSpecificQuotaCalculator
+		quotaCalculator   calculator.NamespaceCalculator
 		// tokens is a map of method name to the number of tokens that should be consumed for that method. If there is
 		// no entry for a method, then no tokens will be consumed, so the method will not be limited.
 		tokens map[string]int
@@ -59,12 +59,16 @@ type (
 var (
 	_ grpc.UnaryServerInterceptor = (*ConcurrentRequestLimitInterceptor)(nil).Intercept
 
-	ErrNamespaceCountLimitServerBusy = serviceerror.NewResourceExhausted(enumspb.RESOURCE_EXHAUSTED_CAUSE_CONCURRENT_LIMIT, "namespace concurrent poller limit exceeded")
+	ErrNamespaceCountLimitServerBusy = &serviceerror.ResourceExhausted{
+		Cause:   enumspb.RESOURCE_EXHAUSTED_CAUSE_CONCURRENT_LIMIT,
+		Scope:   enumspb.RESOURCE_EXHAUSTED_SCOPE_NAMESPACE,
+		Message: "namespace concurrent poller limit exceeded",
+	}
 )
 
 func NewConcurrentRequestLimitInterceptor(
 	namespaceRegistry namespace.Registry,
-	memberCounter quotas.MemberCounter,
+	memberCounter calculator.MemberCounter,
 	logger log.Logger,
 	perInstanceQuota func(ns string) int,
 	globalQuota func(ns string) int,
@@ -73,11 +77,14 @@ func NewConcurrentRequestLimitInterceptor(
 	return &ConcurrentRequestLimitInterceptor{
 		namespaceRegistry: namespaceRegistry,
 		logger:            logger,
-		quotaCalculator: quotas.ClusterAwareNamespaceSpecificQuotaCalculator{
-			MemberCounter:    memberCounter,
-			PerInstanceQuota: perInstanceQuota,
-			GlobalQuota:      globalQuota,
-		},
+		quotaCalculator: calculator.NewLoggedNamespaceCalculator(
+			calculator.ClusterAwareNamespaceQuotaCalculator{
+				MemberCounter:    memberCounter,
+				PerInstanceQuota: perInstanceQuota,
+				GlobalQuota:      globalQuota,
+			},
+			log.With(logger, tag.ComponentLongPollHandler, tag.ScopeNamespace),
+		),
 		tokens:            tokens,
 		activeTokensCount: make(map[string]*int32),
 	}

@@ -65,6 +65,13 @@ func TestNexusPayloadSerializer(t *testing.T) {
 			header:       nexus.Header{},
 		},
 		{
+			// Empty payload is preserved.
+			name:            "empty",
+			inputPayload:    &commonpb.Payload{},
+			expectedPayload: &commonpb.Payload{},
+			header:          nexus.Header{"type": "application/x-temporal-payload"},
+		},
+		{
 			name:         "json proto",
 			inputPayload: mustToPayload(t, commonpb.RetryPolicy{}),
 			header: nexus.Header{
@@ -104,15 +111,16 @@ func TestNexusPayloadSerializer(t *testing.T) {
 					"encoding": []byte("binary/null"),
 				},
 			},
-			// Yes this is the default value, but this test should have an explicit expectation.
-			header: nil,
+			header: nexus.Header{},
 		},
 		{
-			name:         "nil metadata",
-			inputPayload: &commonpb.Payload{},
+			name: "nil metadata non-empty data",
+			inputPayload: &commonpb.Payload{
+				Data: []byte("not empty"),
+			},
 			expectedPayload: &commonpb.Payload{
 				Metadata: map[string][]byte{},
-				Data:     []byte{},
+				Data:     []byte("not empty"),
 			},
 			header: nexus.Header{"type": "application/x-temporal-payload"},
 		},
@@ -205,7 +213,7 @@ func TestNexusPayloadSerializer(t *testing.T) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			s := PayloadSerializer{}
+			s := payloadSerializer{}
 			content, err := s.Serialize(c.inputPayload)
 			require.NoError(t, err)
 			require.Equal(t, c.header, content.Header)

@@ -29,7 +29,6 @@ import (
 	"fmt"
 
 	"go.temporal.io/api/serviceerror"
-
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	p "go.temporal.io/server/common/persistence"
@@ -213,7 +212,7 @@ func (m *MetadataStore) CreateNamespaceInV2Table(
 				}
 			}
 
-			msg := fmt.Sprintf("Namespace already exists.  NamespaceId: %v", existingID)
+			msg := fmt.Sprintf("Namespace already exists. Name: %q, NamespaceId: %v", request.Name, existingID)
 			return nil, serviceerror.NewNamespaceAlreadyExists(msg)
 
 		}
@@ -489,7 +488,7 @@ func (m *MetadataStore) GetMetadata(
 }
 
 func (m *MetadataStore) updateMetadataBatch(
-	batch gocql.Batch,
+	batch *gocql.Batch,
 	notificationVersion int64,
 ) {
 	var nextVersion int64 = 1

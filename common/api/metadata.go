@@ -67,86 +67,111 @@ const (
 const (
 	WorkflowServicePrefix = "/temporal.api.workflowservice.v1.WorkflowService/"
 	OperatorServicePrefix = "/temporal.api.operatorservice.v1.OperatorService/"
+	HistoryServicePrefix  = "/temporal.server.api.historyservice.v1.HistoryService/"
 	AdminServicePrefix    = "/temporal.server.api.adminservice.v1.AdminService/"
+	MatchingServicePrefix = "/temporal.server.api.matchingservice.v1.MatchingService/"
 	// Technically not a gRPC service, but still using this format for metadata.
 	NexusServicePrefix = "/temporal.api.nexusservice.v1.NexusService/"
 )
 
 var (
 	workflowServiceMetadata = map[string]MethodMetadata{
-		"RegisterNamespace":                  {Scope: ScopeNamespace, Access: AccessAdmin},
-		"DescribeNamespace":                  {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"ListNamespaces":                     {Scope: ScopeCluster, Access: AccessReadOnly},
-		"UpdateNamespace":                    {Scope: ScopeNamespace, Access: AccessAdmin},
-		"DeprecateNamespace":                 {Scope: ScopeNamespace, Access: AccessAdmin},
-		"StartWorkflowExecution":             {Scope: ScopeNamespace, Access: AccessWrite},
-		"GetWorkflowExecutionHistory":        {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"GetWorkflowExecutionHistoryReverse": {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"PollWorkflowTaskQueue":              {Scope: ScopeNamespace, Access: AccessWrite},
-		"RespondWorkflowTaskCompleted":       {Scope: ScopeNamespace, Access: AccessWrite},
-		"RespondWorkflowTaskFailed":          {Scope: ScopeNamespace, Access: AccessWrite},
-		"PollActivityTaskQueue":              {Scope: ScopeNamespace, Access: AccessWrite},
-		"RecordActivityTaskHeartbeat":        {Scope: ScopeNamespace, Access: AccessWrite},
-		"RecordActivityTaskHeartbeatById":    {Scope: ScopeNamespace, Access: AccessWrite},
-		"RespondActivityTaskCompleted":       {Scope: ScopeNamespace, Access: AccessWrite},
-		"RespondActivityTaskCompletedById":   {Scope: ScopeNamespace, Access: AccessWrite},
-		"RespondActivityTaskFailed":          {Scope: ScopeNamespace, Access: AccessWrite},
-		"RespondActivityTaskFailedById":      {Scope: ScopeNamespace, Access: AccessWrite},
-		"RespondActivityTaskCanceled":        {Scope: ScopeNamespace, Access: AccessWrite},
-		"RespondActivityTaskCanceledById":    {Scope: ScopeNamespace, Access: AccessWrite},
-		"PollNexusTaskQueue":                 {Scope: ScopeNamespace, Access: AccessWrite},
-		"RespondNexusTaskCompleted":          {Scope: ScopeNamespace, Access: AccessWrite},
-		"RespondNexusTaskFailed":             {Scope: ScopeNamespace, Access: AccessWrite},
-		"RequestCancelWorkflowExecution":     {Scope: ScopeNamespace, Access: AccessWrite},
-		"SignalWorkflowExecution":            {Scope: ScopeNamespace, Access: AccessWrite},
-		"SignalWithStartWorkflowExecution":   {Scope: ScopeNamespace, Access: AccessWrite},
-		"ResetWorkflowExecution":             {Scope: ScopeNamespace, Access: AccessWrite},
-		"TerminateWorkflowExecution":         {Scope: ScopeNamespace, Access: AccessWrite},
-		"DeleteWorkflowExecution":            {Scope: ScopeNamespace, Access: AccessWrite},
-		"ListOpenWorkflowExecutions":         {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"ListClosedWorkflowExecutions":       {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"ListWorkflowExecutions":             {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"ListArchivedWorkflowExecutions":     {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"ScanWorkflowExecutions":             {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"CountWorkflowExecutions":            {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"GetSearchAttributes":                {Scope: ScopeCluster, Access: AccessReadOnly},
-		"RespondQueryTaskCompleted":          {Scope: ScopeNamespace, Access: AccessWrite},
-		"ResetStickyTaskQueue":               {Scope: ScopeNamespace, Access: AccessWrite},
-		"QueryWorkflow":                      {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"DescribeWorkflowExecution":          {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"DescribeTaskQueue":                  {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"GetClusterInfo":                     {Scope: ScopeCluster, Access: AccessReadOnly},
-		"GetSystemInfo":                      {Scope: ScopeCluster, Access: AccessReadOnly},
-		"ListTaskQueuePartitions":            {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"CreateSchedule":                     {Scope: ScopeNamespace, Access: AccessWrite},
-		"DescribeSchedule":                   {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"UpdateSchedule":                     {Scope: ScopeNamespace, Access: AccessWrite},
-		"PatchSchedule":                      {Scope: ScopeNamespace, Access: AccessWrite},
-		"ListScheduleMatchingTimes":          {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"DeleteSchedule":                     {Scope: ScopeNamespace, Access: AccessWrite},
-		"ListSchedules":                      {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"UpdateWorkerBuildIdCompatibility":   {Scope: ScopeNamespace, Access: AccessWrite},
-		"GetWorkerBuildIdCompatibility":      {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"GetWorkerTaskReachability":          {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"UpdateWorkflowExecution":            {Scope: ScopeNamespace, Access: AccessWrite},
-		"PollWorkflowExecutionUpdate":        {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"StartBatchOperation":                {Scope: ScopeNamespace, Access: AccessWrite},
-		"StopBatchOperation":                 {Scope: ScopeNamespace, Access: AccessWrite},
-		"DescribeBatchOperation":             {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"ListBatchOperations":                {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"RegisterNamespace":                     {Scope: ScopeNamespace, Access: AccessAdmin},
+		"DescribeNamespace":                     {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"ListNamespaces":                        {Scope: ScopeCluster, Access: AccessReadOnly},
+		"UpdateNamespace":                       {Scope: ScopeNamespace, Access: AccessAdmin},
+		"DeprecateNamespace":                    {Scope: ScopeNamespace, Access: AccessAdmin},
+		"StartWorkflowExecution":                {Scope: ScopeNamespace, Access: AccessWrite},
+		"GetWorkflowExecutionHistory":           {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"GetWorkflowExecutionHistoryReverse":    {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"PollWorkflowTaskQueue":                 {Scope: ScopeNamespace, Access: AccessWrite},
+		"RespondWorkflowTaskCompleted":          {Scope: ScopeNamespace, Access: AccessWrite},
+		"RespondWorkflowTaskFailed":             {Scope: ScopeNamespace, Access: AccessWrite},
+		"PollActivityTaskQueue":                 {Scope: ScopeNamespace, Access: AccessWrite},
+		"RecordActivityTaskHeartbeat":           {Scope: ScopeNamespace, Access: AccessWrite},
+		"RecordActivityTaskHeartbeatById":       {Scope: ScopeNamespace, Access: AccessWrite},
+		"RespondActivityTaskCompleted":          {Scope: ScopeNamespace, Access: AccessWrite},
+		"RespondActivityTaskCompletedById":      {Scope: ScopeNamespace, Access: AccessWrite},
+		"RespondActivityTaskFailed":             {Scope: ScopeNamespace, Access: AccessWrite},
+		"RespondActivityTaskFailedById":         {Scope: ScopeNamespace, Access: AccessWrite},
+		"RespondActivityTaskCanceled":           {Scope: ScopeNamespace, Access: AccessWrite},
+		"RespondActivityTaskCanceledById":       {Scope: ScopeNamespace, Access: AccessWrite},
+		"PollNexusTaskQueue":                    {Scope: ScopeNamespace, Access: AccessWrite},
+		"RespondNexusTaskCompleted":             {Scope: ScopeNamespace, Access: AccessWrite},
+		"RespondNexusTaskFailed":                {Scope: ScopeNamespace, Access: AccessWrite},
+		"RequestCancelWorkflowExecution":        {Scope: ScopeNamespace, Access: AccessWrite},
+		"SignalWorkflowExecution":               {Scope: ScopeNamespace, Access: AccessWrite},
+		"SignalWithStartWorkflowExecution":      {Scope: ScopeNamespace, Access: AccessWrite},
+		"ResetWorkflowExecution":                {Scope: ScopeNamespace, Access: AccessWrite},
+		"TerminateWorkflowExecution":            {Scope: ScopeNamespace, Access: AccessWrite},
+		"DeleteWorkflowExecution":               {Scope: ScopeNamespace, Access: AccessWrite},
+		"ListOpenWorkflowExecutions":            {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"ListClosedWorkflowExecutions":          {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"ListWorkflowExecutions":                {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"ListArchivedWorkflowExecutions":        {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"ScanWorkflowExecutions":                {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"CountWorkflowExecutions":               {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"GetSearchAttributes":                   {Scope: ScopeCluster, Access: AccessReadOnly},
+		"RespondQueryTaskCompleted":             {Scope: ScopeNamespace, Access: AccessWrite},
+		"ResetStickyTaskQueue":                  {Scope: ScopeNamespace, Access: AccessWrite},
+		"ShutdownWorker":                        {Scope: ScopeNamespace, Access: AccessWrite},
+		"ExecuteMultiOperation":                 {Scope: ScopeNamespace, Access: AccessWrite},
+		"QueryWorkflow":                         {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"DescribeWorkflowExecution":             {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"DescribeTaskQueue":                     {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"GetClusterInfo":                        {Scope: ScopeCluster, Access: AccessReadOnly},
+		"GetSystemInfo":                         {Scope: ScopeCluster, Access: AccessReadOnly},
+		"ListTaskQueuePartitions":               {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"CreateSchedule":                        {Scope: ScopeNamespace, Access: AccessWrite},
+		"DescribeSchedule":                      {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"UpdateSchedule":                        {Scope: ScopeNamespace, Access: AccessWrite},
+		"PatchSchedule":                         {Scope: ScopeNamespace, Access: AccessWrite},
+		"ListScheduleMatchingTimes":             {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"DeleteSchedule":                        {Scope: ScopeNamespace, Access: AccessWrite},
+		"ListSchedules":                         {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"UpdateWorkerBuildIdCompatibility":      {Scope: ScopeNamespace, Access: AccessWrite},
+		"GetWorkerBuildIdCompatibility":         {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"UpdateWorkerVersioningRules":           {Scope: ScopeNamespace, Access: AccessWrite},
+		"GetWorkerVersioningRules":              {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"GetWorkerTaskReachability":             {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"UpdateWorkflowExecution":               {Scope: ScopeNamespace, Access: AccessWrite},
+		"PollWorkflowExecutionUpdate":           {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"StartBatchOperation":                   {Scope: ScopeNamespace, Access: AccessWrite},
+		"StopBatchOperation":                    {Scope: ScopeNamespace, Access: AccessWrite},
+		"DescribeBatchOperation":                {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"ListBatchOperations":                   {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"UpdateActivityOptions":                 {Scope: ScopeNamespace, Access: AccessWrite},
+		"PauseActivity":                         {Scope: ScopeNamespace, Access: AccessWrite},
+		"UnpauseActivity":                       {Scope: ScopeNamespace, Access: AccessWrite},
+		"ResetActivity":                         {Scope: ScopeNamespace, Access: AccessWrite},
+		"UpdateWorkflowExecutionOptions":        {Scope: ScopeNamespace, Access: AccessWrite},
+		"DescribeDeployment":                    {Scope: ScopeNamespace, Access: AccessReadOnly}, // [cleanup-wv-pre-release]
+		"ListDeployments":                       {Scope: ScopeNamespace, Access: AccessReadOnly}, // [cleanup-wv-pre-release]
+		"GetDeploymentReachability":             {Scope: ScopeNamespace, Access: AccessReadOnly}, // [cleanup-wv-pre-release]
+		"GetCurrentDeployment":                  {Scope: ScopeNamespace, Access: AccessReadOnly}, // [cleanup-wv-pre-release]
+		"SetCurrentDeployment":                  {Scope: ScopeNamespace, Access: AccessWrite},    // [cleanup-wv-pre-release]
+		"DescribeWorkerDeploymentVersion":       {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"DescribeWorkerDeployment":              {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"SetWorkerDeploymentCurrentVersion":     {Scope: ScopeNamespace, Access: AccessWrite},
+		"SetWorkerDeploymentRampingVersion":     {Scope: ScopeNamespace, Access: AccessWrite},
+		"DeleteWorkerDeployment":                {Scope: ScopeNamespace, Access: AccessWrite},
+		"DeleteWorkerDeploymentVersion":         {Scope: ScopeNamespace, Access: AccessWrite},
+		"UpdateWorkerDeploymentVersionMetadata": {Scope: ScopeNamespace, Access: AccessWrite},
+		"ListWorkerDeployments":                 {Scope: ScopeNamespace, Access: AccessReadOnly},
 	}
 	operatorServiceMetadata = map[string]MethodMetadata{
-		"AddSearchAttributes":                {Scope: ScopeNamespace, Access: AccessAdmin},
-		"RemoveSearchAttributes":             {Scope: ScopeNamespace, Access: AccessAdmin},
-		"ListSearchAttributes":               {Scope: ScopeNamespace, Access: AccessReadOnly},
-		"DeleteNamespace":                    {Scope: ScopeNamespace, Access: AccessAdmin},
-		"AddOrUpdateRemoteCluster":           {Scope: ScopeCluster, Access: AccessAdmin},
-		"RemoveRemoteCluster":                {Scope: ScopeCluster, Access: AccessAdmin},
-		"ListClusters":                       {Scope: ScopeCluster, Access: AccessAdmin},
-		"CreateOrUpdateNexusIncomingService": {Scope: ScopeCluster, Access: AccessAdmin},
-		"DeleteNexusIncomingService":         {Scope: ScopeCluster, Access: AccessAdmin},
-		"GetNexusIncomingService":            {Scope: ScopeCluster, Access: AccessAdmin},
-		"ListNexusIncomingServices":          {Scope: ScopeCluster, Access: AccessAdmin},
+		"AddSearchAttributes":      {Scope: ScopeNamespace, Access: AccessAdmin},
+		"RemoveSearchAttributes":   {Scope: ScopeNamespace, Access: AccessAdmin},
+		"ListSearchAttributes":     {Scope: ScopeNamespace, Access: AccessReadOnly},
+		"DeleteNamespace":          {Scope: ScopeNamespace, Access: AccessAdmin},
+		"AddOrUpdateRemoteCluster": {Scope: ScopeCluster, Access: AccessAdmin},
+		"RemoveRemoteCluster":      {Scope: ScopeCluster, Access: AccessAdmin},
+		"ListClusters":             {Scope: ScopeCluster, Access: AccessAdmin},
+		"CreateNexusEndpoint":      {Scope: ScopeCluster, Access: AccessAdmin},
+		"UpdateNexusEndpoint":      {Scope: ScopeCluster, Access: AccessAdmin},
+		"DeleteNexusEndpoint":      {Scope: ScopeCluster, Access: AccessAdmin},
+		"GetNexusEndpoint":         {Scope: ScopeCluster, Access: AccessAdmin},
+		"ListNexusEndpoints":       {Scope: ScopeCluster, Access: AccessAdmin},
 	}
 	nexusServiceMetadata = map[string]MethodMetadata{
 		"DispatchNexusTask": {Scope: ScopeNamespace, Access: AccessWrite},
@@ -170,11 +195,19 @@ func GetMethodMetadata(fullApiName string) MethodMetadata {
 	}
 }
 
-// BaseName returns just the method name from a fullly qualified name.
+// MethodName returns just the method name from a fully qualified name.
 func MethodName(fullApiName string) string {
 	index := strings.LastIndex(fullApiName, "/")
 	if index > -1 {
 		return fullApiName[index+1:]
 	}
 	return fullApiName
+}
+
+func ServiceName(fullApiName string) string {
+	index := strings.LastIndex(fullApiName, "/")
+	if index > -1 {
+		return fullApiName[:index+1]
+	}
+	return ""
 }

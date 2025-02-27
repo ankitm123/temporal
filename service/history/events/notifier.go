@@ -32,15 +32,16 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
-
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	historyspb "go.temporal.io/server/api/history/v1"
+	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/collection"
 	"go.temporal.io/server/common/definition"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/persistence/transitionhistory"
 	"go.temporal.io/server/common/persistence/versionhistory"
 )
 
@@ -67,6 +68,7 @@ type (
 		WorkflowState          enumsspb.WorkflowExecutionState
 		WorkflowStatus         enumspb.WorkflowExecutionStatus
 		VersionHistories       *historyspb.VersionHistories
+		TransitionHistory      []*persistencespb.VersionedTransition
 	}
 
 	NotifierImpl struct {
@@ -101,6 +103,7 @@ func NewNotification(
 	workflowState enumsspb.WorkflowExecutionState,
 	workflowStatus enumspb.WorkflowExecutionStatus,
 	versionHistories *historyspb.VersionHistories,
+	transitionHistory []*persistencespb.VersionedTransition,
 ) *Notification {
 
 	return &Notification{
@@ -116,6 +119,7 @@ func NewNotification(
 		WorkflowState:          workflowState,
 		WorkflowStatus:         workflowStatus,
 		VersionHistories:       versionhistory.CopyVersionHistories(versionHistories),
+		TransitionHistory:      transitionhistory.CopyVersionedTransitions(transitionHistory),
 	}
 }
 

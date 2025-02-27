@@ -25,12 +25,13 @@
 package metrics
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
 	enumspb "go.temporal.io/api/enums/v1"
 	enumsspb "go.temporal.io/server/api/enums/v1"
-
+	"go.temporal.io/server/common/locks"
 	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/util"
 )
@@ -44,7 +45,9 @@ const (
 
 	instance       = "instance"
 	namespace      = "namespace"
+	namespaceID    = "namespace_id"
 	namespaceState = "namespace_state"
+	sourceCluster  = "source_cluster"
 	targetCluster  = "target_cluster"
 	fromCluster    = "from_cluster"
 	toCluster      = "to_cluster"
@@ -54,6 +57,8 @@ const (
 	commandType    = "commandType"
 	serviceName    = "service_name"
 	actionType     = "action_type"
+	workerBuildId  = "worker-build-id"
+	destination    = "destination"
 	// Generic reason tag can be used anywhere a reason is needed.
 	reason = "reason"
 	// See server.api.enums.v1.ReplicationTaskType
@@ -73,8 +78,6 @@ type Tag interface {
 	Value() string
 }
 
-var StickyTaskQueueTag = TaskQueueTag("__sticky__")
-
 type (
 	tagImpl struct {
 		key   string
@@ -90,6 +93,10 @@ func (v *tagImpl) Value() string {
 	return v.value
 }
 
+func (v *tagImpl) String() string {
+	return fmt.Sprintf("tag{key: %q, value: %q}", v.key, v.value)
+}
+
 // NamespaceTag returns a new namespace tag. For timers, this also ensures that we
 // dual emit the metric with the all tag. If a blank namespace is provided then
 // this converts that to an unknown namespace.
@@ -99,6 +106,17 @@ func NamespaceTag(value string) Tag {
 	}
 	return &tagImpl{
 		key:   namespace,
+		value: value,
+	}
+}
+
+// NamespaceIDTag returns a new namespace ID tag.
+func NamespaceIDTag(value string) Tag {
+	if len(value) == 0 {
+		value = unknownValue
+	}
+	return &tagImpl{
+		key:   namespaceID,
 		value: value,
 	}
 }
@@ -133,6 +151,14 @@ func InstanceTag(value string) Tag {
 	return &tagImpl{key: instance, value: value}
 }
 
+// SourceClusterTag returns a new source cluster tag.
+func SourceClusterTag(value string) Tag {
+	if len(value) == 0 {
+		value = unknownValue
+	}
+	return &tagImpl{key: sourceCluster, value: value}
+}
+
 // TargetClusterTag returns a new target cluster tag.
 func TargetClusterTag(value string) Tag {
 	if len(value) == 0 {
@@ -151,16 +177,33 @@ func ToClusterIDTag(value int32) Tag {
 	return &tagImpl{key: toCluster, value: strconv.FormatInt(int64(value), 10)}
 }
 
-// TaskQueueTag returns a new task queue tag.
-func TaskQueueTag(value string) Tag {
+// UnsafeTaskQueueTag returns a new task queue tag.
+// WARNING: Do not use this function directly in production code as it may create high number of unique task queue tag
+// values that can trouble the observability stack. Instead, use one of the following helper functions and pass a proper
+// breakdown boolean (typically based on the task queue dynamic configs):
+// - `workflow.PerTaskQueueFamilyScope`
+// - `tqid.PerTaskQueueFamilyScope`
+// - `tqid.PerTaskQueueScope`
+// - `tqid.PerTaskQueuePartitionScope`
+func UnsafeTaskQueueTag(value string) Tag {
 	if len(value) == 0 {
 		value = unknownValue
 	}
-	return &tagImpl{key: taskQueue, value: sanitizer.Value(value)}
+	return &tagImpl{key: taskQueue, value: value}
 }
 
 func TaskQueueTypeTag(tqType enumspb.TaskQueueType) Tag {
 	return &tagImpl{key: TaskTypeTagName, value: tqType.String()}
+}
+
+// Consider passing the value of "metrics.breakdownByBuildID" dynamic config to this function.
+func WorkerBuildIdTag(buildId string, buildIdBreakdown bool) Tag {
+	if buildId == "" {
+		buildId = "__unversioned__"
+	} else if !buildIdBreakdown {
+		buildId = "__versioned__"
+	}
+	return &tagImpl{key: workerBuildId, value: buildId}
 }
 
 // WorkflowTypeTag returns a new workflow type tag.
@@ -203,6 +246,13 @@ func FailureTag(value string) Tag {
 	return &tagImpl{key: FailureTagName, value: value}
 }
 
+func FailureSourceTag(value string) Tag {
+	if len(value) == 0 {
+		value = unknownValue
+	}
+	return &tagImpl{key: FailureSourceTagName, value: value}
+}
+
 func TaskCategoryTag(value string) Tag {
 	if len(value) == 0 {
 		value = unknownValue
@@ -215,6 +265,10 @@ func TaskTypeTag(value string) Tag {
 		value = unknownValue
 	}
 	return &tagImpl{key: TaskTypeTagName, value: value}
+}
+
+func PartitionTag(partition string) Tag {
+	return &tagImpl{key: PartitionTagName, value: partition}
 }
 
 func TaskPriorityTag(value string) Tag {
@@ -249,21 +303,43 @@ func VisibilityPluginNameTag(value string) Tag {
 	return &tagImpl{key: visibilityPluginNameTagName, value: value}
 }
 
-// VersionedTag represents whether a loaded task queue manager represents a specific version set.
-func VersionedTag(versioned bool) Tag {
-	return &tagImpl{key: versionedTagName, value: strconv.FormatBool(versioned)}
+func VisibilityIndexNameTag(value string) Tag {
+	if value == "" {
+		value = unknownValue
+	}
+	return &tagImpl{key: visibilityIndexNameTagName, value: value}
+}
+
+// VersionedTag represents whether a loaded task queue manager represents a specific version set or build ID or not.
+func VersionedTag(versioned string) Tag {
+	return &tagImpl{key: versionedTagName, value: versioned}
 }
 
 func ServiceErrorTypeTag(err error) Tag {
 	return &tagImpl{key: ErrorTypeTagName, value: strings.TrimPrefix(util.ErrorType(err), errorPrefix)}
 }
 
-func NexusOutcomeTag(outcome string) Tag {
-	return &tagImpl{key: nexusOutcomeTagName, value: outcome}
+func OutcomeTag(outcome string) Tag {
+	return &tagImpl{key: outcomeTagName, value: outcome}
 }
 
 func NexusMethodTag(value string) Tag {
 	return &tagImpl{key: nexusMethodTagName, value: value}
+}
+
+func NexusEndpointTag(value string) Tag {
+	if len(value) == 0 {
+		value = unknownValue
+	}
+	return &tagImpl{key: nexusEndpointTagName, value: value}
+}
+
+func NexusServiceTag(value string) Tag {
+	return &tagImpl{key: nexusServiceTagName, value: value}
+}
+
+func NexusOperationTag(value string) Tag {
+	return &tagImpl{key: nexusOperationTagName, value: value}
 }
 
 // HttpStatusTag returns a new httpStatusTag.
@@ -273,6 +349,10 @@ func HttpStatusTag(value int) Tag {
 
 func ResourceExhaustedCauseTag(cause enumspb.ResourceExhaustedCause) Tag {
 	return &tagImpl{key: resourceExhaustedTag, value: cause.String()}
+}
+
+func ResourceExhaustedScopeTag(scope enumspb.ResourceExhaustedScope) Tag {
+	return &tagImpl{key: resourceExhaustedScopeTag, value: scope.String()}
 }
 
 func ServiceNameTag(value primitives.ServiceName) Tag {
@@ -295,6 +375,10 @@ func CacheTypeTag(value string) Tag {
 	return &tagImpl{key: CacheTypeTagName, value: value}
 }
 
+func PriorityTag(value locks.Priority) Tag {
+	return &tagImpl{key: PriorityTagName, value: strconv.Itoa(int(value))}
+}
+
 // ReasonString is just a string but the special type is defined here to remind callers of ReasonTag to limit the
 // cardinality of possible reasons.
 type ReasonString string
@@ -308,4 +392,12 @@ func ReasonTag(value ReasonString) Tag {
 // ReplicationTaskTypeTag returns a new replication task type tag.
 func ReplicationTaskTypeTag(value enumsspb.ReplicationTaskType) Tag {
 	return &tagImpl{key: replicationTaskType, value: value.String()}
+}
+
+// DestinationTag is a tag for metrics emitted by outbound task executors for the task's destination.
+func DestinationTag(value string) Tag {
+	return &tagImpl{
+		key:   destination,
+		value: value,
+	}
 }

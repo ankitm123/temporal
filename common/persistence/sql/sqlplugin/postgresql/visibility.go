@@ -68,8 +68,9 @@ func buildOnDuplicateKeyUpdate(fields ...string) string {
 		items[i] = fmt.Sprintf("%s = excluded.%s", field, field)
 	}
 	return fmt.Sprintf(
-		"ON CONFLICT (namespace_id, run_id) DO UPDATE SET %s",
-		strings.Join(items, ", "),
+		// The WHERE clause ensures that no update occurs if the version is behind the saved version.
+		"ON CONFLICT (namespace_id, run_id) DO UPDATE SET %s WHERE executions_visibility.%s < EXCLUDED.%s",
+		strings.Join(items, ", "), sqlplugin.VersionColumnName, sqlplugin.VersionColumnName,
 	)
 }
 
@@ -80,7 +81,7 @@ func (pdb *db) InsertIntoVisibility(
 	row *sqlplugin.VisibilityRow,
 ) (sql.Result, error) {
 	finalRow := pdb.prepareRowForDB(row)
-	return pdb.conn.NamedExecContext(ctx, templateInsertWorkflowExecution, finalRow)
+	return pdb.NamedExecContext(ctx, templateInsertWorkflowExecution, finalRow)
 }
 
 // ReplaceIntoVisibility replaces an existing row if it exist or creates a new row in visibility table
@@ -89,7 +90,7 @@ func (pdb *db) ReplaceIntoVisibility(
 	row *sqlplugin.VisibilityRow,
 ) (sql.Result, error) {
 	finalRow := pdb.prepareRowForDB(row)
-	return pdb.conn.NamedExecContext(ctx, templateUpsertWorkflowExecution, finalRow)
+	return pdb.NamedExecContext(ctx, templateUpsertWorkflowExecution, finalRow)
 }
 
 // DeleteFromVisibility deletes a row from visibility table if it exist
@@ -97,7 +98,7 @@ func (pdb *db) DeleteFromVisibility(
 	ctx context.Context,
 	filter sqlplugin.VisibilityDeleteFilter,
 ) (sql.Result, error) {
-	return pdb.conn.NamedExecContext(ctx, templateDeleteWorkflowExecution_v12, filter)
+	return pdb.NamedExecContext(ctx, templateDeleteWorkflowExecution_v12, filter)
 }
 
 // SelectFromVisibility reads one or more rows from visibility table
@@ -114,9 +115,13 @@ func (pdb *db) SelectFromVisibility(
 	}
 
 	// Rebind will replace default placeholder `?` with the right placeholder for PostgreSQL.
-	filter.Query = pdb.db.Rebind(filter.Query)
+	db, err := pdb.handle.DB()
+	if err != nil {
+		return nil, err
+	}
+	filter.Query = db.Rebind(filter.Query)
 	var rows []sqlplugin.VisibilityRow
-	err := pdb.conn.SelectContext(ctx, &rows, filter.Query, filter.QueryArgs...)
+	err = db.SelectContext(ctx, &rows, filter.Query, filter.QueryArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +140,7 @@ func (pdb *db) GetFromVisibility(
 	filter sqlplugin.VisibilityGetFilter,
 ) (*sqlplugin.VisibilityRow, error) {
 	var row sqlplugin.VisibilityRow
-	stmt, err := pdb.conn.PrepareNamedContext(ctx, templateGetWorkflowExecution_v12)
+	stmt, err := pdb.PrepareNamedContext(ctx, templateGetWorkflowExecution_v12)
 	if err != nil {
 		return nil, err
 	}
@@ -155,8 +160,8 @@ func (pdb *db) CountFromVisibility(
 	filter sqlplugin.VisibilitySelectFilter,
 ) (int64, error) {
 	var count int64
-	filter.Query = pdb.db.Rebind(filter.Query)
-	err := pdb.conn.GetContext(ctx, &count, filter.Query, filter.QueryArgs...)
+	filter.Query = pdb.Rebind(filter.Query)
+	err := pdb.GetContext(ctx, &count, filter.Query, filter.QueryArgs...)
 	if err != nil {
 		return 0, err
 	}
@@ -167,8 +172,8 @@ func (pdb *db) CountGroupByFromVisibility(
 	ctx context.Context,
 	filter sqlplugin.VisibilitySelectFilter,
 ) ([]sqlplugin.VisibilityCountRow, error) {
-	filter.Query = pdb.db.Rebind(filter.Query)
-	rows, err := pdb.db.QueryContext(ctx, filter.Query, filter.QueryArgs...)
+	filter.Query = pdb.Rebind(filter.Query)
+	rows, err := pdb.QueryContext(ctx, filter.Query, filter.QueryArgs...)
 	if err != nil {
 		return nil, err
 	}
