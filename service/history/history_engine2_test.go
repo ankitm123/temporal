@@ -31,7 +31,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -44,44 +43,47 @@ import (
 	"go.temporal.io/api/serviceerror"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
-	"google.golang.org/protobuf/types/known/durationpb"
-	"google.golang.org/protobuf/types/known/timestamppb"
-
-	"go.temporal.io/server/common/dynamicconfig"
-	"go.temporal.io/server/common/payload"
-	"go.temporal.io/server/common/searchattribute"
-	"go.temporal.io/server/common/testing/protorequire"
-
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	historyspb "go.temporal.io/server/api/history/v1"
 	"go.temporal.io/server/api/historyservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
+	tokenspb "go.temporal.io/server/api/token/v1"
 	workflowspb "go.temporal.io/server/api/workflow/v1"
+	"go.temporal.io/server/common"
+	"go.temporal.io/server/common/clock"
+	"go.temporal.io/server/common/cluster"
+	"go.temporal.io/server/common/dynamicconfig"
+	"go.temporal.io/server/common/locks"
+	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/log/tag"
+	"go.temporal.io/server/common/metrics"
+	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/payload"
+	"go.temporal.io/server/common/payloads"
+	"go.temporal.io/server/common/persistence"
+	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/common/persistence/versionhistory"
 	"go.temporal.io/server/common/persistence/visibility/manager"
 	"go.temporal.io/server/common/primitives/timestamp"
+	"go.temporal.io/server/common/searchattribute"
 	serviceerrors "go.temporal.io/server/common/serviceerror"
+	"go.temporal.io/server/common/tasktoken"
+	"go.temporal.io/server/common/testing/protorequire"
+	"go.temporal.io/server/common/testing/testvars"
 	"go.temporal.io/server/service/history/api"
 	"go.temporal.io/server/service/history/configs"
 	"go.temporal.io/server/service/history/consts"
 	"go.temporal.io/server/service/history/events"
+	"go.temporal.io/server/service/history/hsm"
 	"go.temporal.io/server/service/history/queues"
 	"go.temporal.io/server/service/history/shard"
 	"go.temporal.io/server/service/history/tasks"
 	"go.temporal.io/server/service/history/tests"
 	"go.temporal.io/server/service/history/workflow"
 	wcache "go.temporal.io/server/service/history/workflow/cache"
-
-	tokenspb "go.temporal.io/server/api/token/v1"
-	"go.temporal.io/server/common"
-	"go.temporal.io/server/common/clock"
-	"go.temporal.io/server/common/cluster"
-	"go.temporal.io/server/common/log"
-	"go.temporal.io/server/common/log/tag"
-	"go.temporal.io/server/common/metrics"
-	"go.temporal.io/server/common/namespace"
-	"go.temporal.io/server/common/payloads"
-	"go.temporal.io/server/common/persistence"
+	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type (
@@ -109,6 +111,7 @@ type (
 		config        *configs.Config
 		logger        *log.MockLogger
 		errorMessages []string
+		tv            *testvars.TestVars
 	}
 )
 
@@ -152,9 +155,12 @@ func (s *engine2Suite) SetupTest() {
 		},
 		s.config,
 	)
-	s.mockShard = mockShard
-	s.mockShard.Resource.ShardMgr.EXPECT().AssertShardOwnership(gomock.Any(), gomock.Any()).AnyTimes()
+	reg := hsm.NewRegistry()
+	err := workflow.RegisterStateMachine(reg)
+	s.NoError(err)
+	mockShard.SetStateMachineRegistry(reg)
 
+	s.mockShard = mockShard
 	s.mockNamespaceCache = s.mockShard.Resource.NamespaceCache
 	s.mockExecutionMgr = s.mockShard.Resource.ExecutionMgr
 	s.mockClusterMetadata = s.mockShard.Resource.ClusterMetadata
@@ -180,7 +186,7 @@ func (s *engine2Suite) SetupTest() {
 			},
 		).
 		AnyTimes()
-	s.workflowCache = wcache.NewHostLevelCache(s.mockShard.GetConfig(), metrics.NoopMetricsHandler)
+	s.workflowCache = wcache.NewHostLevelCache(s.mockShard.GetConfig(), s.mockShard.GetLogger(), metrics.NoopMetricsHandler)
 	s.logger = log.NewMockLogger(s.controller)
 	s.logger.EXPECT().Debug(gomock.Any(), gomock.Any()).AnyTimes()
 	s.logger.EXPECT().Info(gomock.Any(), gomock.Any()).AnyTimes()
@@ -198,7 +204,7 @@ func (s *engine2Suite) SetupTest() {
 		logger:             s.logger,
 		throttledLogger:    s.logger,
 		metricsHandler:     metrics.NoopMetricsHandler,
-		tokenSerializer:    common.NewProtoTaskTokenSerializer(),
+		tokenSerializer:    tasktoken.NewSerializer(),
 		config:             s.config,
 		timeSource:         s.mockShard.GetTimeSource(),
 		eventNotifier:      events.NewNotifier(clock.NewRealTimeSource(), metrics.NoopMetricsHandler, func(namespace.ID, string) int32 { return 1 }),
@@ -217,14 +223,17 @@ func (s *engine2Suite) SetupTest() {
 			s.config.SearchAttributesTotalSizeLimit,
 			s.mockVisibilityManager,
 			dynamicconfig.GetBoolPropertyFnFilteredByNamespace(false),
+			dynamicconfig.GetBoolPropertyFnFilteredByNamespace(false),
 		),
 		workflowConsistencyChecker: api.NewWorkflowConsistencyChecker(mockShard, s.workflowCache),
 		persistenceVisibilityMgr:   s.mockVisibilityManager,
 	}
 	s.mockShard.SetEngineForTesting(h)
-	h.workflowTaskHandler = newWorkflowTaskHandlerCallback(h)
 
 	s.historyEngine = h
+
+	s.tv = testvars.New(s.T()).WithNamespaceID(tests.NamespaceID)
+	s.tv = s.tv.WithRunID(s.tv.Any().RunID())
 }
 
 func (s *engine2Suite) SetupSubTest() {
@@ -314,11 +323,11 @@ func (s *engine2Suite) TestRecordWorkflowTaskStartedSuccessStickyEnabled() {
 		},
 	}
 
-	expectedResponse := historyservice.RecordWorkflowTaskStartedResponse{}
+	expectedResponse := historyservice.RecordWorkflowTaskStartedResponseWithRawHistory{}
 	expectedResponse.WorkflowType = ms.GetWorkflowType()
 	executionInfo = ms.GetExecutionInfo()
-	if executionInfo.LastWorkflowTaskStartedEventId != common.EmptyEventID {
-		expectedResponse.PreviousStartedEventId = executionInfo.LastWorkflowTaskStartedEventId
+	if executionInfo.LastCompletedWorkflowTaskStartedEventId != common.EmptyEventID {
+		expectedResponse.PreviousStartedEventId = executionInfo.LastCompletedWorkflowTaskStartedEventId
 	}
 	expectedResponse.Version = tests.GlobalNamespaceEntry.FailoverVersion()
 	expectedResponse.ScheduledEventId = wt.ScheduledEventID
@@ -335,6 +344,116 @@ func (s *engine2Suite) TestRecordWorkflowTaskStartedSuccessStickyEnabled() {
 	s.NoError(err)
 	expectedResponse.BranchToken = currentBranchTokken
 	expectedResponse.History = &historypb.History{Events: fakeHistory}
+	expectedResponse.NextPageToken = nil
+
+	response, err := s.historyEngine.RecordWorkflowTaskStarted(metrics.AddMetricsContext(context.Background()), &request)
+	s.Nil(err)
+	s.NotNil(response)
+	s.True(response.StartedTime.AsTime().After(expectedResponse.ScheduledTime.AsTime()))
+	expectedResponse.StartedTime = response.StartedTime
+	s.Equal(&expectedResponse, response)
+}
+
+func (s *engine2Suite) TestRecordWorkflowTaskStartedSuccessStickyEnabled_WithInternalRawHistory() {
+	s.config.SendRawHistoryBetweenInternalServices = func() bool { return true }
+	serializer := serialization.NewSerializer()
+	fakeHistory := []*historypb.HistoryEvent{
+		{
+			EventId:   int64(1),
+			EventType: enumspb.EVENT_TYPE_WORKFLOW_TASK_SCHEDULED,
+		},
+		{
+			EventId:   int64(2),
+			EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+			Attributes: &historypb.HistoryEvent_WorkflowExecutionStartedEventAttributes{
+				WorkflowExecutionStartedEventAttributes: &historypb.WorkflowExecutionStartedEventAttributes{
+					SearchAttributes: &commonpb.SearchAttributes{
+						IndexedFields: map[string]*commonpb.Payload{
+							"CustomKeywordField":    payload.EncodeString("random-keyword"),
+							"TemporalChangeVersion": payload.EncodeString("random-data"),
+						},
+					},
+				},
+			},
+		},
+		{
+			EventId:   int64(3),
+			EventType: enumspb.EVENT_TYPE_WORKFLOW_TASK_STARTED,
+		},
+	}
+	historyBlob, err := serializer.SerializeEvents(fakeHistory, enumspb.ENCODING_TYPE_PROTO3)
+	s.NoError(err)
+
+	s.mockExecutionMgr.EXPECT().ReadRawHistoryBranch(gomock.Any(), gomock.Any()).Return(&persistence.ReadRawHistoryBranchResponse{
+		HistoryEventBlobs: []*commonpb.DataBlob{
+			{
+				EncodingType: enumspb.ENCODING_TYPE_PROTO3,
+				Data:         historyBlob.Data,
+			},
+		},
+		NextPageToken: []byte{},
+		Size:          1,
+	}, nil)
+
+	namespaceID := tests.NamespaceID
+	we := &commonpb.WorkflowExecution{
+		WorkflowId: "wId",
+		RunId:      tests.RunID,
+	}
+	tl := "testTaskQueue"
+	stickyTl := "stickyTaskQueue"
+	identity := "testIdentity"
+
+	ms := workflow.TestLocalMutableState(s.historyEngine.shardContext, s.mockEventsCache, tests.LocalNamespaceEntry,
+		we.GetWorkflowId(), we.GetRunId(), log.NewTestLogger())
+	executionInfo := ms.GetExecutionInfo()
+	executionInfo.LastUpdateTime = timestamp.TimeNowPtrUtc()
+	executionInfo.StickyTaskQueue = stickyTl
+
+	addWorkflowExecutionStartedEvent(ms, we, "wType", tl, payloads.EncodeString("input"), 100*time.Second, 50*time.Second, 200*time.Second, identity)
+	wt := addWorkflowTaskScheduledEvent(ms)
+
+	wfMs := workflow.TestCloneToProto(ms)
+
+	gwmsResponse := &persistence.GetWorkflowExecutionResponse{State: wfMs}
+
+	s.mockExecutionMgr.EXPECT().GetWorkflowExecution(gomock.Any(), gomock.Any()).Return(gwmsResponse, nil)
+	s.mockExecutionMgr.EXPECT().UpdateWorkflowExecution(gomock.Any(), gomock.Any()).Return(tests.UpdateWorkflowExecutionResponse, nil)
+
+	request := historyservice.RecordWorkflowTaskStartedRequest{
+		NamespaceId:       namespaceID.String(),
+		WorkflowExecution: we,
+		ScheduledEventId:  2,
+		RequestId:         "reqId",
+		PollRequest: &workflowservice.PollWorkflowTaskQueueRequest{
+			TaskQueue: &taskqueuepb.TaskQueue{
+				Name: stickyTl,
+			},
+			Identity: identity,
+		},
+	}
+
+	expectedResponse := historyservice.RecordWorkflowTaskStartedResponseWithRawHistory{}
+	expectedResponse.WorkflowType = ms.GetWorkflowType()
+	executionInfo = ms.GetExecutionInfo()
+	if executionInfo.LastCompletedWorkflowTaskStartedEventId != common.EmptyEventID {
+		expectedResponse.PreviousStartedEventId = executionInfo.LastCompletedWorkflowTaskStartedEventId
+	}
+	expectedResponse.Version = tests.GlobalNamespaceEntry.FailoverVersion()
+	expectedResponse.ScheduledEventId = wt.ScheduledEventID
+	expectedResponse.ScheduledTime = timestamppb.New(wt.ScheduledTime)
+	expectedResponse.StartedEventId = wt.ScheduledEventID + 1
+	expectedResponse.StickyExecutionEnabled = true
+	expectedResponse.NextEventId = ms.GetNextEventID() + 1
+	expectedResponse.Attempt = wt.Attempt
+	expectedResponse.WorkflowExecutionTaskQueue = &taskqueuepb.TaskQueue{
+		Name: executionInfo.TaskQueue,
+		Kind: enumspb.TASK_QUEUE_KIND_NORMAL,
+	}
+	currentBranchTokken, err := ms.GetCurrentBranchToken()
+	s.NoError(err)
+	expectedResponse.BranchToken = currentBranchTokken
+	expectedResponse.RawHistory = [][]byte{historyBlob.Data}
 	expectedResponse.NextPageToken = nil
 
 	response, err := s.historyEngine.RecordWorkflowTaskStarted(metrics.AddMetricsContext(context.Background()), &request)
@@ -613,7 +732,109 @@ func (s *engine2Suite) TestRecordWorkflowTaskStartedSuccess() {
 		s.mockShard,
 		tests.NamespaceID,
 		workflowExecution,
-		workflow.LockPriorityHigh,
+		locks.PriorityHigh,
+	)
+	s.NoError(err)
+	loadedMS, err := ctx.LoadMutableState(context.Background(), s.mockShard)
+	s.NoError(err)
+	qr := workflow.NewQueryRegistry()
+	id1, _ := qr.BufferQuery(&querypb.WorkflowQuery{})
+	id2, _ := qr.BufferQuery(&querypb.WorkflowQuery{})
+	id3, _ := qr.BufferQuery(&querypb.WorkflowQuery{})
+	loadedMS.(*workflow.MutableStateImpl).QueryRegistry = qr
+	release(nil)
+
+	response, err := s.historyEngine.RecordWorkflowTaskStarted(metrics.AddMetricsContext(context.Background()), &historyservice.RecordWorkflowTaskStartedRequest{
+		NamespaceId:       namespaceID.String(),
+		WorkflowExecution: workflowExecution,
+		ScheduledEventId:  2,
+		RequestId:         "reqId",
+		PollRequest: &workflowservice.PollWorkflowTaskQueueRequest{
+			TaskQueue: &taskqueuepb.TaskQueue{
+				Name: tl,
+			},
+			Identity: identity,
+		},
+	})
+
+	s.Nil(err)
+	s.NotNil(response)
+	s.Equal("wType", response.WorkflowType.Name)
+	s.True(response.PreviousStartedEventId == 0)
+	s.Equal(int64(3), response.StartedEventId)
+	expectedQueryMap := map[string]*querypb.WorkflowQuery{
+		id1: {},
+		id2: {},
+		id3: {},
+	}
+	s.Equal(expectedQueryMap, response.Queries)
+}
+
+func (s *engine2Suite) TestRecordWorkflowTaskStartedSuccessWithInternalRawHistory() {
+	s.config.SendRawHistoryBetweenInternalServices = func() bool { return true }
+	fakeHistory := historypb.History{
+		Events: []*historypb.HistoryEvent{
+			{
+				EventId:   int64(1),
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_TASK_SCHEDULED,
+			},
+			{
+				EventId:   int64(2),
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+				Attributes: &historypb.HistoryEvent_WorkflowExecutionStartedEventAttributes{
+					WorkflowExecutionStartedEventAttributes: &historypb.WorkflowExecutionStartedEventAttributes{
+						SearchAttributes: &commonpb.SearchAttributes{
+							IndexedFields: map[string]*commonpb.Payload{
+								"CustomKeywordField":    payload.EncodeString("random-keyword"),
+								"TemporalChangeVersion": payload.EncodeString("random-data"),
+							},
+						},
+					},
+				},
+			},
+			{
+				EventId:   int64(3),
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_TASK_STARTED,
+			},
+		},
+	}
+	historyBlob, err := fakeHistory.Marshal()
+	s.NoError(err)
+
+	s.mockExecutionMgr.EXPECT().ReadRawHistoryBranch(gomock.Any(), gomock.Any()).Return(&persistence.ReadRawHistoryBranchResponse{
+		HistoryEventBlobs: []*commonpb.DataBlob{
+			{
+				EncodingType: enumspb.ENCODING_TYPE_PROTO3,
+				Data:         historyBlob,
+			},
+		},
+		NextPageToken: []byte{},
+		Size:          1,
+	}, nil)
+
+	namespaceID := tests.NamespaceID
+	workflowExecution := &commonpb.WorkflowExecution{
+		WorkflowId: "wId",
+		RunId:      tests.RunID,
+	}
+
+	tl := "testTaskQueue"
+	identity := "testIdentity"
+
+	ms := s.createExecutionStartedState(workflowExecution, tl, identity, true, false)
+	wfMs := workflow.TestCloneToProto(ms)
+	gwmsResponse := &persistence.GetWorkflowExecutionResponse{State: wfMs}
+	s.mockExecutionMgr.EXPECT().GetWorkflowExecution(gomock.Any(), gomock.Any()).Return(gwmsResponse, nil)
+	s.mockExecutionMgr.EXPECT().UpdateWorkflowExecution(gomock.Any(), gomock.Any()).Return(tests.UpdateWorkflowExecutionResponse, nil)
+
+	// load mutable state such that it already exists in memory when respond workflow task is called
+	// this enables us to set query registry on it
+	ctx, release, err := s.workflowCache.GetOrCreateWorkflowExecution(
+		metrics.AddMetricsContext(context.Background()),
+		s.mockShard,
+		tests.NamespaceID,
+		workflowExecution,
+		locks.PriorityHigh,
 	)
 	s.NoError(err)
 	loadedMS, err := ctx.LoadMutableState(context.Background(), s.mockShard)
@@ -997,7 +1218,7 @@ func (s *engine2Suite) TestRespondWorkflowTaskCompletedRecordMarkerCommand() {
 	s.Nil(err)
 	ms2 := s.getMutableState(namespaceID, we)
 	s.Equal(int64(6), ms2.GetNextEventID())
-	s.Equal(int64(3), ms2.GetExecutionInfo().LastWorkflowTaskStartedEventId)
+	s.Equal(int64(3), ms2.GetExecutionInfo().LastCompletedWorkflowTaskStartedEventId)
 	s.Equal(enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING, ms2.GetExecutionState().State)
 	s.False(ms2.HasPendingWorkflowTask())
 }
@@ -1103,6 +1324,7 @@ func (s *engine2Suite) TestRespondWorkflowTaskCompleted_StartChildWorkflow_Excee
 		identity,
 	)
 
+	s.mockShard.SetLoggers(s.logger)
 	s.mockNamespaceCache.EXPECT().GetNamespace(tests.Namespace).Return(tests.LocalNamespaceEntry, nil).AnyTimes()
 
 	var commands []*commandpb.Command
@@ -1233,10 +1455,208 @@ func (s *engine2Suite) TestStartWorkflowExecution_BrandNew_SearchAttributes() {
 	s.NotNil(resp.RunId)
 }
 
+func makeMockStartRequest(
+	tv *testvars.TestVars,
+	wfReusePolicy enumspb.WorkflowIdReusePolicy,
+	wfConflictPolicy enumspb.WorkflowIdConflictPolicy,
+) *historyservice.StartWorkflowExecutionRequest {
+	return &historyservice.StartWorkflowExecutionRequest{
+		Attempt:     1,
+		NamespaceId: tv.NamespaceID().String(),
+		StartRequest: &workflowservice.StartWorkflowExecutionRequest{
+			Namespace:                tv.NamespaceID().String(),
+			WorkflowId:               tv.WorkflowID(),
+			WorkflowType:             tv.WorkflowType(),
+			TaskQueue:                tv.TaskQueue(),
+			WorkflowExecutionTimeout: durationpb.New(1 * time.Second),
+			WorkflowTaskTimeout:      durationpb.New(2 * time.Second),
+			WorkflowIdReusePolicy:    wfReusePolicy,
+			WorkflowIdConflictPolicy: wfConflictPolicy,
+			Identity:                 tv.WorkerIdentity(),
+			RequestId:                tv.Any().String(),
+		},
+	}
+}
+
+func makeCurrentWorkflowConditionFailedError(
+	tv *testvars.TestVars,
+	startTime *timestamppb.Timestamp,
+) error {
+	lastWriteVersion := common.EmptyVersion
+	tv1 := tv.WithRequestID("AttachedRequestID1")
+	tv2 := tv.WithRequestID("AttachedRequestID2")
+	return &persistence.CurrentWorkflowConditionFailedError{
+		Msg: "random message",
+		RequestIDs: map[string]*persistencespb.RequestIDInfo{
+			tv.RequestID(): {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+			},
+			tv1.RequestID(): {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
+			},
+			tv2.RequestID(): {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
+			},
+		},
+		RunID:            tv.RunID(),
+		State:            enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING,
+		Status:           enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		LastWriteVersion: lastWriteVersion,
+		StartTime:        timestamp.TimeValuePtr(startTime),
+	}
+}
+
+func (s *engine2Suite) setupStartWorkflowExecutionDedup(startTime *timestamppb.Timestamp) *workflow.MutableStateImpl {
+	brandNewExecutionRequest := mock.MatchedBy(func(request *persistence.CreateWorkflowExecutionRequest) bool {
+		return request.Mode == persistence.CreateWorkflowModeBrandNew
+	})
+	currentWorkflowConditionFailedError := makeCurrentWorkflowConditionFailedError(s.tv, startTime)
+	s.mockExecutionMgr.EXPECT().CreateWorkflowExecution(gomock.Any(), brandNewExecutionRequest).
+		Return(nil, currentWorkflowConditionFailedError).AnyTimes()
+
+	ms := workflow.TestGlobalMutableState(
+		s.historyEngine.shardContext,
+		s.mockEventsCache,
+		log.NewTestLogger(),
+		tests.Version,
+		s.tv.WorkflowID(),
+		s.tv.RunID(),
+	)
+	ms.GetExecutionInfo().VersionHistories.Histories[0].Items = []*historyspb.VersionHistoryItem{{Version: 0, EventId: 0}}
+	ms.GetExecutionState().StartTime = startTime
+	return ms
+}
+
+func (s *engine2Suite) setupStartWorkflowExecutionForRunning() {
+	now := s.historyEngine.shardContext.GetTimeSource().Now()
+	startTime := timestamppb.New(now.Add(-100 * time.Millisecond))
+	s.setupStartWorkflowExecutionDedup(startTime)
+}
+
+func (s *engine2Suite) setupStartWorkflowExecutionForTerminate() {
+	now := s.historyEngine.shardContext.GetTimeSource().Now()
+	startTime := timestamppb.New(now.Add(-2 * time.Second))
+	ms := s.setupStartWorkflowExecutionDedup(startTime)
+
+	s.mockExecutionMgr.EXPECT().UpdateWorkflowExecution(
+		gomock.Any(),
+		mock.MatchedBy(func(req *persistence.UpdateWorkflowExecutionRequest) bool {
+			return req.UpdateWorkflowMutation.ExecutionState.Status == enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED
+		}),
+	).Return(&persistence.UpdateWorkflowExecutionResponse{
+		UpdateMutableStateStats: persistence.MutableStateStatistics{
+			HistoryStatistics: &persistence.HistoryStatistics{SizeDiff: 1},
+		},
+	}, nil).AnyTimes()
+
+	s.mockExecutionMgr.EXPECT().GetWorkflowExecution(gomock.Any(), gomock.Any()).
+		Return(&persistence.GetWorkflowExecutionResponse{State: workflow.TestCloneToProto(ms)}, nil)
+}
+
+func (s *engine2Suite) TestStartWorkflowExecution_Dedup_Running_CalledTooSoon() {
+	// error when id reuse policy is WORKFLOW_ID_CONFLICT_POLICY_TERMINATE_EXISTING but called too soon
+	s.setupStartWorkflowExecutionForRunning()
+
+	startRequest := makeMockStartRequest(s.tv, enumspb.WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED, enumspb.WORKFLOW_ID_CONFLICT_POLICY_TERMINATE_EXISTING)
+
+	resp, err := s.historyEngine.StartWorkflowExecution(metrics.AddMetricsContext(context.Background()), startRequest)
+
+	var expectedErr *serviceerror.ResourceExhausted
+	s.ErrorAs(err, &expectedErr)
+	s.Nil(resp)
+}
+
+func (s *engine2Suite) TestStartWorkflowExecution_Dedup_Running_SameRequestID() {
+	// no error when request ID is the same
+	s.setupStartWorkflowExecutionForRunning()
+	startRequest := makeMockStartRequest(s.tv, enumspb.WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED, enumspb.WORKFLOW_ID_CONFLICT_POLICY_TERMINATE_EXISTING)
+	startRequest.StartRequest.RequestId = s.tv.RequestID()
+
+	resp, err := s.historyEngine.StartWorkflowExecution(metrics.AddMetricsContext(context.Background()), startRequest)
+
+	s.NoError(err)
+	s.True(resp.Started)
+	s.Equal(s.tv.RunID(), resp.GetRunId())
+}
+
+func (s *engine2Suite) TestStartWorkflowExecution_Dedup_Running_SameAttachedRequestID() {
+	// no error when request ID is the same
+	s.setupStartWorkflowExecutionForRunning()
+	startRequest := makeMockStartRequest(
+		s.tv,
+		enumspb.WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED,
+		enumspb.WORKFLOW_ID_CONFLICT_POLICY_TERMINATE_EXISTING,
+	)
+
+	tv1 := s.tv.WithRequestID("AttachedRequestID1")
+	startRequest.StartRequest.RequestId = tv1.RequestID()
+	resp, err := s.historyEngine.StartWorkflowExecution(metrics.AddMetricsContext(context.Background()), startRequest)
+	s.NoError(err)
+	s.False(resp.Started)
+	s.Equal(s.tv.RunID(), resp.GetRunId())
+
+	tv2 := s.tv.WithRequestID("AttachedRequestID2")
+	startRequest.StartRequest.RequestId = tv2.RequestID()
+	resp, err = s.historyEngine.StartWorkflowExecution(metrics.AddMetricsContext(context.Background()), startRequest)
+	s.NoError(err)
+	s.False(resp.Started)
+	s.Equal(s.tv.RunID(), resp.GetRunId())
+}
+
+func (s *engine2Suite) TestStartWorkflowExecution_Dedup_Running_PolicyFail() {
+	// error when id conflict policy is POLICY_FAIL
+	s.setupStartWorkflowExecutionForRunning()
+
+	startRequest := makeMockStartRequest(s.tv, enumspb.WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED, enumspb.WORKFLOW_ID_CONFLICT_POLICY_FAIL)
+
+	resp, err := s.historyEngine.StartWorkflowExecution(metrics.AddMetricsContext(context.Background()), startRequest)
+
+	var expectedErr *serviceerror.WorkflowExecutionAlreadyStarted
+	s.ErrorAs(err, &expectedErr)
+	s.Nil(resp)
+}
+
+func (s *engine2Suite) TestStartWorkflowExecution_Dedup_Running_UseExisting() {
+	// ignore error when id conflict policy is USE_EXISTING
+	s.setupStartWorkflowExecutionForRunning()
+
+	startRequest := makeMockStartRequest(s.tv, enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE, enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING)
+
+	resp, err := s.historyEngine.StartWorkflowExecution(metrics.AddMetricsContext(context.Background()), startRequest)
+
+	s.NoError(err)
+	s.False(resp.Started)
+	s.Equal(s.tv.RunID(), resp.GetRunId())
+}
+
+func (s *engine2Suite) TestStartWorkflowExecution_Terminate_Running() {
+	s.setupStartWorkflowExecutionForTerminate()
+
+	startRequest := makeMockStartRequest(s.tv, enumspb.WORKFLOW_ID_REUSE_POLICY_TERMINATE_IF_RUNNING, enumspb.WORKFLOW_ID_CONFLICT_POLICY_UNSPECIFIED)
+
+	resp, err := s.historyEngine.StartWorkflowExecution(metrics.AddMetricsContext(context.Background()), startRequest)
+
+	s.NoError(err)
+	s.True(resp.Started)
+	s.NotEqual(s.tv.RunID(), resp.GetRunId())
+}
+
+func (s *engine2Suite) TestStartWorkflowExecution_Terminate_Existing() {
+	s.setupStartWorkflowExecutionForTerminate()
+
+	startRequest := makeMockStartRequest(s.tv, enumspb.WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED, enumspb.WORKFLOW_ID_CONFLICT_POLICY_TERMINATE_EXISTING)
+
+	resp, err := s.historyEngine.StartWorkflowExecution(metrics.AddMetricsContext(context.Background()), startRequest)
+
+	s.NoError(err)
+	s.True(resp.Started)
+	s.NotEqual(s.tv.RunID(), resp.GetRunId())
+}
+
 func (s *engine2Suite) TestStartWorkflowExecution_Dedup() {
 	namespaceID := tests.NamespaceID
 	workflowID := "workflowID"
-	prevRunID := "prevRunID"
+	prevRunID := uuid.New()
 	workflowType := "workflowType"
 	taskQueue := "testTaskQueue"
 	identity := "testIdentity"
@@ -1244,8 +1664,13 @@ func (s *engine2Suite) TestStartWorkflowExecution_Dedup() {
 	prevRequestID := "oldRequestID"
 	lastWriteVersion := common.EmptyVersion
 
+	brandNewExecutionRequest := mock.MatchedBy(func(request *persistence.CreateWorkflowExecutionRequest) bool {
+		return request.Mode == persistence.CreateWorkflowModeBrandNew
+	})
+
 	makeStartRequest := func(
 		wfReusePolicy enumspb.WorkflowIdReusePolicy,
+		wfConflictPolicy enumspb.WorkflowIdConflictPolicy,
 	) *historyservice.StartWorkflowExecutionRequest {
 		return &historyservice.StartWorkflowExecutionRequest{
 			Attempt:     1,
@@ -1258,100 +1683,36 @@ func (s *engine2Suite) TestStartWorkflowExecution_Dedup() {
 				WorkflowExecutionTimeout: durationpb.New(1 * time.Second),
 				WorkflowTaskTimeout:      durationpb.New(2 * time.Second),
 				WorkflowIdReusePolicy:    wfReusePolicy,
+				WorkflowIdConflictPolicy: wfConflictPolicy,
 				Identity:                 identity,
 				RequestId:                requestID,
 			},
 		}
 	}
 
-	s.Run("when workflow is running", func() {
-		makeCurrentWorkflowConditionFailedError := func(
-			requestID string,
-		) *persistence.CurrentWorkflowConditionFailedError {
-			return &persistence.CurrentWorkflowConditionFailedError{
-				Msg:              "random message",
-				RequestID:        requestID,
-				RunID:            prevRunID,
-				State:            enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING,
-				Status:           enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
-				LastWriteVersion: lastWriteVersion,
-			}
-		}
-
-		s.Run("ignore when request ID is the same", func() {
-			s.mockExecutionMgr.EXPECT().CreateWorkflowExecution(gomock.Any(), gomock.Any()).
-				Return(nil, makeCurrentWorkflowConditionFailedError(requestID)) // *same* request ID!
-
-			resp, err := s.historyEngine.StartWorkflowExecution(
-				metrics.AddMetricsContext(context.Background()),
-				makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE))
-
-			s.NoError(err)
-			s.Equal(prevRunID, resp.GetRunId())
-		})
-
-		s.Run("return error when request ID is not the same", func() {
-			s.mockExecutionMgr.EXPECT().CreateWorkflowExecution(gomock.Any(), gomock.Any()).
-				Return(nil, makeCurrentWorkflowConditionFailedError(prevRequestID))
-
-			resp, err := s.historyEngine.StartWorkflowExecution(
-				metrics.AddMetricsContext(context.Background()),
-				makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE))
-
-			var expectedErr *serviceerror.WorkflowExecutionAlreadyStarted
-			s.ErrorAs(err, &expectedErr)
-			s.Nil(resp)
-		})
-
-		s.Run("terminate when id reuse policy is TERMINATE_IF_RUNNING", func() {
-			failedError := makeCurrentWorkflowConditionFailedError(prevRequestID)
-			failedError.RunID = uuid.New()
-
-			s.mockExecutionMgr.EXPECT().CreateWorkflowExecution(gomock.Any(), gomock.Any()).
-				Return(nil, failedError)
-
-			ms := workflow.TestGlobalMutableState(s.historyEngine.shardContext, s.mockEventsCache, log.NewTestLogger(), tests.Version, tests.WorkflowID, tests.RunID)
-			ms.GetExecutionInfo().VersionHistories.Histories[0].Items = []*historyspb.VersionHistoryItem{{Version: 0, EventId: 0}}
-
-			s.mockExecutionMgr.EXPECT().GetWorkflowExecution(gomock.Any(), gomock.Any()).
-				Return(&persistence.GetWorkflowExecutionResponse{State: workflow.TestCloneToProto(ms)}, nil)
-			s.mockExecutionMgr.EXPECT().UpdateWorkflowExecution(
-				gomock.Any(),
-				mock.MatchedBy(func(req *persistence.UpdateWorkflowExecutionRequest) bool {
-					return req.UpdateWorkflowMutation.ExecutionState.Status == enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED
-				}),
-			).Return(&persistence.UpdateWorkflowExecutionResponse{
-				UpdateMutableStateStats: persistence.MutableStateStatistics{
-					HistoryStatistics: &persistence.HistoryStatistics{SizeDiff: 1},
-				},
-			}, nil)
-
-			resp, err := s.historyEngine.StartWorkflowExecution(
-				metrics.AddMetricsContext(context.Background()),
-				makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_TERMINATE_IF_RUNNING))
-
-			s.NoError(err)
-			s.NotEqual(prevRunID, resp.GetRunId())
-		})
-	})
+	now := s.historyEngine.shardContext.GetTimeSource().Now()
+	ms := workflow.TestGlobalMutableState(s.historyEngine.shardContext, s.mockEventsCache, log.NewTestLogger(), tests.Version, workflowID, prevRunID)
+	ms.GetExecutionInfo().VersionHistories.Histories[0].Items = []*historyspb.VersionHistoryItem{{Version: 0, EventId: 0}}
+	ms.GetExecutionState().StartTime = timestamppb.New(now.Add(-2 * time.Second))
 
 	s.Run("when workflow completed", func() {
 		makeCurrentWorkflowConditionFailedError := func(
 			requestID string,
-		) *persistence.CurrentWorkflowConditionFailedError {
+		) error {
 			return &persistence.CurrentWorkflowConditionFailedError{
-				Msg:              "random message",
-				RequestID:        requestID,
+				Msg: "random message",
+				RequestIDs: map[string]*persistencespb.RequestIDInfo{
+					requestID: {
+						EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+					},
+				},
 				RunID:            prevRunID,
 				State:            enumsspb.WORKFLOW_EXECUTION_STATE_COMPLETED,
 				Status:           enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
 				LastWriteVersion: lastWriteVersion,
+				StartTime:        nil,
 			}
 		}
-
-		brandNewExecutionRequest := mock.MatchedBy(func(request *persistence.CreateWorkflowExecutionRequest) bool {
-			return request.Mode == persistence.CreateWorkflowModeBrandNew
-		})
 
 		updateExecutionRequest := mock.MatchedBy(func(request *persistence.CreateWorkflowExecutionRequest) bool {
 			return request.Mode == persistence.CreateWorkflowModeUpdateCurrent &&
@@ -1359,19 +1720,20 @@ func (s *engine2Suite) TestStartWorkflowExecution_Dedup() {
 				request.PreviousLastWriteVersion == lastWriteVersion
 		})
 
-		s.Run("ignore when request ID is the same", func() {
+		s.Run("ignore error when request ID is the same", func() {
 			s.mockExecutionMgr.EXPECT().CreateWorkflowExecution(gomock.Any(), brandNewExecutionRequest).
 				Return(nil, makeCurrentWorkflowConditionFailedError(requestID)) // *same* request ID!
 
 			resp, err := s.historyEngine.StartWorkflowExecution(
 				metrics.AddMetricsContext(context.Background()),
-				makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE))
+				makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE, enumspb.WORKFLOW_ID_CONFLICT_POLICY_FAIL))
 
 			s.NoError(err)
 			s.Equal(prevRunID, resp.GetRunId())
 		})
 
 		s.Run("with success", func() {
+
 			s.Run("and id reuse policy is ALLOW_DUPLICATE", func() {
 				s.mockExecutionMgr.EXPECT().CreateWorkflowExecution(gomock.Any(), brandNewExecutionRequest).
 					Return(nil, makeCurrentWorkflowConditionFailedError(prevRequestID))
@@ -1380,9 +1742,10 @@ func (s *engine2Suite) TestStartWorkflowExecution_Dedup() {
 
 				resp, err := s.historyEngine.StartWorkflowExecution(
 					metrics.AddMetricsContext(context.Background()),
-					makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE))
+					makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE, enumspb.WORKFLOW_ID_CONFLICT_POLICY_FAIL))
 
 				s.NoError(err)
+				s.True(resp.Started)
 				s.NotEqual(prevRunID, resp.GetRunId())
 			})
 
@@ -1394,9 +1757,10 @@ func (s *engine2Suite) TestStartWorkflowExecution_Dedup() {
 
 				resp, err := s.historyEngine.StartWorkflowExecution(
 					metrics.AddMetricsContext(context.Background()),
-					makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_TERMINATE_IF_RUNNING))
+					makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_TERMINATE_IF_RUNNING, enumspb.WORKFLOW_ID_CONFLICT_POLICY_FAIL))
 
 				s.NoError(err)
+				s.True(resp.Started)
 				s.NotEqual(prevRunID, resp.GetRunId())
 			})
 
@@ -1406,7 +1770,7 @@ func (s *engine2Suite) TestStartWorkflowExecution_Dedup() {
 
 				resp, err := s.historyEngine.StartWorkflowExecution(
 					metrics.AddMetricsContext(context.Background()),
-					makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY))
+					makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY, enumspb.WORKFLOW_ID_CONFLICT_POLICY_FAIL))
 
 				var expectedErr *serviceerror.WorkflowExecutionAlreadyStarted
 				s.ErrorAs(err, &expectedErr)
@@ -1419,7 +1783,7 @@ func (s *engine2Suite) TestStartWorkflowExecution_Dedup() {
 
 				resp, err := s.historyEngine.StartWorkflowExecution(
 					metrics.AddMetricsContext(context.Background()),
-					makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE))
+					makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE, enumspb.WORKFLOW_ID_CONFLICT_POLICY_FAIL))
 
 				var expectedErr *serviceerror.WorkflowExecutionAlreadyStarted
 				s.ErrorAs(err, &expectedErr)
@@ -1438,14 +1802,19 @@ func (s *engine2Suite) TestStartWorkflowExecution_Dedup() {
 			for _, status := range failureStatuses {
 				makeCurrentWorkflowConditionFailedError := func(
 					requestID string,
-				) *persistence.CurrentWorkflowConditionFailedError {
+				) error {
 					return &persistence.CurrentWorkflowConditionFailedError{
-						Msg:              "random message",
-						RequestID:        requestID,
+						Msg: "random message",
+						RequestIDs: map[string]*persistencespb.RequestIDInfo{
+							requestID: {
+								EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+							},
+						},
 						RunID:            prevRunID,
 						State:            enumsspb.WORKFLOW_EXECUTION_STATE_COMPLETED,
 						Status:           status,
 						LastWriteVersion: lastWriteVersion,
+						StartTime:        nil,
 					}
 				}
 
@@ -1456,7 +1825,7 @@ func (s *engine2Suite) TestStartWorkflowExecution_Dedup() {
 
 						resp, err := s.historyEngine.StartWorkflowExecution(
 							metrics.AddMetricsContext(context.Background()),
-							makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE))
+							makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE, enumspb.WORKFLOW_ID_CONFLICT_POLICY_FAIL))
 
 						var expectedErr *serviceerror.WorkflowExecutionAlreadyStarted
 						s.ErrorAs(err, &expectedErr)
@@ -1471,9 +1840,10 @@ func (s *engine2Suite) TestStartWorkflowExecution_Dedup() {
 
 						resp, err := s.historyEngine.StartWorkflowExecution(
 							metrics.AddMetricsContext(context.Background()),
-							makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY))
+							makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY, enumspb.WORKFLOW_ID_CONFLICT_POLICY_FAIL))
 
 						s.NoError(err)
+						s.True(resp.Started)
 						s.NotEqual(prevRunID, resp.GetRunId())
 					})
 
@@ -1483,7 +1853,7 @@ func (s *engine2Suite) TestStartWorkflowExecution_Dedup() {
 
 						resp, err := s.historyEngine.StartWorkflowExecution(
 							metrics.AddMetricsContext(context.Background()),
-							makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE))
+							makeStartRequest(enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE, enumspb.WORKFLOW_ID_CONFLICT_POLICY_FAIL))
 
 						var expectedErr *serviceerror.WorkflowExecutionAlreadyStarted
 						s.ErrorAs(err, &expectedErr)
@@ -1692,12 +2062,18 @@ func (s *engine2Suite) TestSignalWithStartWorkflowExecution_Start_DuplicateReque
 	gwmsResponse := &persistence.GetWorkflowExecutionResponse{State: wfMs}
 	gceResponse := &persistence.GetCurrentExecutionResponse{RunID: runID}
 	workflowAlreadyStartedErr := &persistence.CurrentWorkflowConditionFailedError{
-		Msg:              "random message",
-		RequestID:        requestID, // use same requestID
+		Msg: "random message",
+		RequestIDs: map[string]*persistencespb.RequestIDInfo{
+			// use same requestID
+			requestID: {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+			},
+		},
 		RunID:            runID,
 		State:            enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING,
 		Status:           enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
 		LastWriteVersion: common.EmptyVersion,
+		StartTime:        nil,
 	}
 
 	s.mockExecutionMgr.EXPECT().GetCurrentExecution(gomock.Any(), gomock.Any()).Return(gceResponse, nil).AnyTimes()
@@ -1758,12 +2134,17 @@ func (s *engine2Suite) TestSignalWithStartWorkflowExecution_Start_WorkflowAlread
 	gwmsResponse := &persistence.GetWorkflowExecutionResponse{State: wfMs}
 	gceResponse := &persistence.GetCurrentExecutionResponse{RunID: runID}
 	workflowAlreadyStartedErr := &persistence.CurrentWorkflowConditionFailedError{
-		Msg:              "random message",
-		RequestID:        "new request ID",
+		Msg: "random message",
+		RequestIDs: map[string]*persistencespb.RequestIDInfo{
+			"new request ID": {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+			},
+		},
 		RunID:            runID,
 		State:            enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING,
 		Status:           enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
 		LastWriteVersion: common.EmptyVersion,
+		StartTime:        nil,
 	}
 
 	s.mockExecutionMgr.EXPECT().GetCurrentExecution(gomock.Any(), gomock.Any()).Return(gceResponse, nil).AnyTimes()
@@ -1825,6 +2206,7 @@ func (s *engine2Suite) TestRecordChildExecutionCompleted() {
 		tests.ChildNamespace, tests.ChildNamespaceID, childWorkflowID, childWorkflowType, childTaskQueueName, nil, 1*time.Second, 1*time.Second, 1*time.Second, enumspb.PARENT_CLOSE_POLICY_TERMINATE)
 	request.ParentInitiatedId = initiatedEvent.GetEventId()
 	request.ParentInitiatedVersion = initiatedEvent.GetVersion()
+	request.ChildFirstExecutionRunId = childRunID
 
 	// add child started event
 	addChildWorkflowExecutionStartedEvent(ms, initiatedEvent.GetEventId(), childWorkflowID, childRunID, childWorkflowType, nil)
@@ -1835,6 +2217,99 @@ func (s *engine2Suite) TestRecordChildExecutionCompleted() {
 	s.mockExecutionMgr.EXPECT().UpdateWorkflowExecution(gomock.Any(), gomock.Any()).Return(tests.UpdateWorkflowExecutionResponse, nil)
 	_, err = s.historyEngine.RecordChildExecutionCompleted(metrics.AddMetricsContext(context.Background()), request)
 	s.NoError(err)
+}
+
+func (s *engine2Suite) TestRecordChildExecutionCompleted_ChildFirstRunId() {
+	childWorkflowID := "some random child workflow ID"
+	childRunID := uuid.New()
+	childWorkflowType := "some random child workflow type"
+	childTaskQueueName := "some random child task queue"
+
+	testcases := []struct {
+		name            string
+		childFirstRunID string
+		expectedError   error
+	}{
+		{
+			name:            "empty child first run id",
+			childFirstRunID: "",
+		},
+		{
+			name:            "child first run id is set",
+			childFirstRunID: childRunID,
+		},
+		{
+			name:            "child first run id doesnt match",
+			childFirstRunID: "wrong_run_id",
+			expectedError:   consts.ErrChildExecutionNotFound,
+		},
+	}
+
+	for _, tc := range testcases {
+		s.Run(tc.name, func() {
+			request := &historyservice.RecordChildExecutionCompletedRequest{
+				NamespaceId: tests.NamespaceID.String(),
+				ParentExecution: &commonpb.WorkflowExecution{
+					WorkflowId: tests.WorkflowID,
+					RunId:      tests.RunID,
+				},
+				ChildExecution: &commonpb.WorkflowExecution{
+					WorkflowId: childWorkflowID,
+					RunId:      childRunID,
+				},
+				CompletionEvent: &historypb.HistoryEvent{
+					EventId:   456,
+					EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED,
+					Attributes: &historypb.HistoryEvent_WorkflowExecutionCompletedEventAttributes{
+						WorkflowExecutionCompletedEventAttributes: &historypb.WorkflowExecutionCompletedEventAttributes{},
+					},
+				},
+				ParentInitiatedId:      123,
+				ParentInitiatedVersion: 100,
+			}
+
+			ms := workflow.TestGlobalMutableState(s.historyEngine.shardContext, s.mockEventsCache, log.NewTestLogger(), tests.Version, tests.WorkflowID, tests.RunID)
+			addWorkflowExecutionStartedEvent(ms, &commonpb.WorkflowExecution{
+				WorkflowId: tests.WorkflowID,
+				RunId:      tests.RunID,
+			}, "wType", "testTaskQueue", payloads.EncodeString("input"), 25*time.Second, 20*time.Second, 200*time.Second, "identity")
+			wfMs := workflow.TestCloneToProto(ms)
+			gwmsResponse := &persistence.GetWorkflowExecutionResponse{State: wfMs}
+
+			// reload mutable state due to potential stale mutable state (initiated event not found)
+			s.mockExecutionMgr.EXPECT().GetWorkflowExecution(gomock.Any(), gomock.Any()).Return(gwmsResponse, nil).Times(2)
+			_, err := s.historyEngine.RecordChildExecutionCompleted(metrics.AddMetricsContext(context.Background()), request)
+			s.IsType(&serviceerror.NotFound{}, err)
+
+			// add child init event
+			wt := addWorkflowTaskScheduledEvent(ms)
+			workflowTasksStartEvent := addWorkflowTaskStartedEvent(ms, wt.ScheduledEventID, "testTaskQueue", uuid.New())
+			wt.StartedEventID = workflowTasksStartEvent.GetEventId()
+			workflowTaskCompletedEvent := addWorkflowTaskCompletedEvent(&s.Suite, ms, wt.ScheduledEventID, wt.StartedEventID, "some random identity")
+
+			initiatedEvent, _ := addStartChildWorkflowExecutionInitiatedEvent(ms, workflowTaskCompletedEvent.GetEventId(), uuid.New(),
+				tests.ChildNamespace, tests.ChildNamespaceID, childWorkflowID, childWorkflowType, childTaskQueueName, nil, 1*time.Second, 1*time.Second, 1*time.Second, enumspb.PARENT_CLOSE_POLICY_TERMINATE)
+			request.ParentInitiatedId = initiatedEvent.GetEventId()
+			request.ParentInitiatedVersion = initiatedEvent.GetVersion()
+			request.ChildFirstExecutionRunId = tc.childFirstRunID
+
+			// add child started event
+			addChildWorkflowExecutionStartedEvent(ms, initiatedEvent.GetEventId(), childWorkflowID, childRunID, childWorkflowType, nil)
+
+			wfMs = workflow.TestCloneToProto(ms)
+			gwmsResponse = &persistence.GetWorkflowExecutionResponse{State: wfMs}
+			s.mockExecutionMgr.EXPECT().GetWorkflowExecution(gomock.Any(), gomock.Any()).Return(gwmsResponse, nil)
+			if tc.expectedError == nil {
+				s.mockExecutionMgr.EXPECT().UpdateWorkflowExecution(gomock.Any(), gomock.Any()).Return(tests.UpdateWorkflowExecutionResponse, nil)
+			}
+			_, err = s.historyEngine.RecordChildExecutionCompleted(metrics.AddMetricsContext(context.Background()), request)
+			if tc.expectedError != nil {
+				s.Equal(tc.expectedError, err)
+			} else {
+				s.NoError(err)
+			}
+		})
+	}
 }
 
 func (s *engine2Suite) TestRecordChildExecutionCompleted_MissingChildStartedEvent() {
@@ -1882,6 +2357,7 @@ func (s *engine2Suite) TestRecordChildExecutionCompleted_MissingChildStartedEven
 		tests.ChildNamespace, tests.ChildNamespaceID, childWorkflowID, childWorkflowType, childTaskQueueName, nil, 1*time.Second, 1*time.Second, 1*time.Second, enumspb.PARENT_CLOSE_POLICY_TERMINATE)
 	request.ParentInitiatedId = initiatedEvent.GetEventId()
 	request.ParentInitiatedVersion = initiatedEvent.GetVersion()
+	request.ChildFirstExecutionRunId = childRunID
 
 	// started event not found, should automatically be added
 	wfMs = workflow.TestCloneToProto(ms)
@@ -1891,6 +2367,85 @@ func (s *engine2Suite) TestRecordChildExecutionCompleted_MissingChildStartedEven
 	s.mockExecutionMgr.EXPECT().UpdateWorkflowExecution(gomock.Any(), gomock.Any()).Return(tests.UpdateWorkflowExecutionResponse, nil)
 	_, err := s.historyEngine.RecordChildExecutionCompleted(metrics.AddMetricsContext(context.Background()), request)
 	s.NoError(err)
+}
+
+func (s *engine2Suite) TestRecordChildExecutionCompleted_MissingChildStartedEvent_ChildFirstRunId() {
+	childWorkflowID := "some random child workflow ID"
+	childRunID := uuid.New()
+	childWorkflowType := "some random child workflow type"
+	childTaskQueueName := "some random child task queue"
+
+	testcases := []struct {
+		name            string
+		childFirstRunID string
+	}{
+		{
+			name:            "empty child first run id",
+			childFirstRunID: "",
+		},
+		{
+			name:            "child first run id is same as current run id",
+			childFirstRunID: childRunID,
+		},
+		{
+			name:            "child first run id is different",
+			childFirstRunID: "wrong_run_id",
+		},
+	}
+
+	for _, tc := range testcases {
+		s.Run(tc.name, func() {
+			request := &historyservice.RecordChildExecutionCompletedRequest{
+				NamespaceId: tests.NamespaceID.String(),
+				ParentExecution: &commonpb.WorkflowExecution{
+					WorkflowId: tests.WorkflowID,
+					RunId:      tests.RunID,
+				},
+				ChildExecution: &commonpb.WorkflowExecution{
+					WorkflowId: childWorkflowID,
+					RunId:      childRunID,
+				},
+				CompletionEvent: &historypb.HistoryEvent{
+					EventId:   456,
+					EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED,
+					Attributes: &historypb.HistoryEvent_WorkflowExecutionCompletedEventAttributes{
+						WorkflowExecutionCompletedEventAttributes: &historypb.WorkflowExecutionCompletedEventAttributes{},
+					},
+				},
+				ParentInitiatedId:      123,
+				ParentInitiatedVersion: 100,
+			}
+
+			ms := workflow.TestGlobalMutableState(s.historyEngine.shardContext, s.mockEventsCache, log.NewTestLogger(), tests.Version, tests.WorkflowID, tests.RunID)
+			addWorkflowExecutionStartedEvent(ms, &commonpb.WorkflowExecution{
+				WorkflowId: tests.WorkflowID,
+				RunId:      tests.RunID,
+			}, "wType", "testTaskQueue", payloads.EncodeString("input"), 25*time.Second, 20*time.Second, 200*time.Second, "identity")
+			wfMs := workflow.TestCloneToProto(ms)
+			gwmsResponse := &persistence.GetWorkflowExecutionResponse{State: wfMs}
+
+			// add child init event
+			wt := addWorkflowTaskScheduledEvent(ms)
+			workflowTasksStartEvent := addWorkflowTaskStartedEvent(ms, wt.ScheduledEventID, "testTaskQueue", uuid.New())
+			wt.StartedEventID = workflowTasksStartEvent.GetEventId()
+			workflowTaskCompletedEvent := addWorkflowTaskCompletedEvent(&s.Suite, ms, wt.ScheduledEventID, wt.StartedEventID, "some random identity")
+
+			initiatedEvent, _ := addStartChildWorkflowExecutionInitiatedEvent(ms, workflowTaskCompletedEvent.GetEventId(), uuid.New(),
+				tests.ChildNamespace, tests.ChildNamespaceID, childWorkflowID, childWorkflowType, childTaskQueueName, nil, 1*time.Second, 1*time.Second, 1*time.Second, enumspb.PARENT_CLOSE_POLICY_TERMINATE)
+			request.ParentInitiatedId = initiatedEvent.GetEventId()
+			request.ParentInitiatedVersion = initiatedEvent.GetVersion()
+			request.ChildFirstExecutionRunId = tc.childFirstRunID
+
+			// started event not found, should automatically be added
+			wfMs = workflow.TestCloneToProto(ms)
+			gwmsResponse = &persistence.GetWorkflowExecutionResponse{State: wfMs}
+			s.mockExecutionMgr.EXPECT().GetWorkflowExecution(gomock.Any(), gomock.Any()).Return(gwmsResponse, nil)
+			s.mockEventsCache.EXPECT().GetEvent(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(initiatedEvent, nil)
+			s.mockExecutionMgr.EXPECT().UpdateWorkflowExecution(gomock.Any(), gomock.Any()).Return(tests.UpdateWorkflowExecutionResponse, nil)
+			_, err := s.historyEngine.RecordChildExecutionCompleted(metrics.AddMetricsContext(context.Background()), request)
+			s.NoError(err)
+		})
+	}
 }
 
 func (s *engine2Suite) TestVerifyChildExecutionCompletionRecorded_WorkflowNotExist() {
@@ -2125,7 +2680,7 @@ func (s *engine2Suite) TestRefreshWorkflowTasks() {
 	wfMs := workflow.TestCloneToProto(ms)
 	gwmsResponse := &persistence.GetWorkflowExecutionResponse{State: wfMs}
 	s.mockExecutionMgr.EXPECT().GetWorkflowExecution(gomock.Any(), gomock.Any()).Return(gwmsResponse, nil)
-	s.mockExecutionMgr.EXPECT().AddHistoryTasks(gomock.Any(), gomock.Any()).Return(nil)
+	s.mockExecutionMgr.EXPECT().SetWorkflowExecution(gomock.Any(), gomock.Any()).Return(&persistence.SetWorkflowExecutionResponse{}, nil)
 	s.mockEventsCache.EXPECT().GetEvent(
 		gomock.Any(),
 		gomock.Any(),
@@ -2163,7 +2718,7 @@ func (s *engine2Suite) getMutableState(namespaceID namespace.ID, we *commonpb.Wo
 		s.mockShard,
 		namespaceID,
 		we,
-		workflow.LockPriorityHigh,
+		locks.PriorityHigh,
 	)
 	if err != nil {
 		return nil

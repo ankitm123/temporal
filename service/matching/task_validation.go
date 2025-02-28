@@ -31,7 +31,6 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
-
 	"go.temporal.io/server/api/historyservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common/cluster"
@@ -46,6 +45,12 @@ const (
 
 type (
 	taskValidator interface {
+		// maybeValidate checks if a task has expired / is valid
+		// if return false, then task is invalid and should be discarded
+		// if return true, then task is *maybe-valid*, and should be dispatched
+		//
+		// a task is invalid if this task is already failed; timeout; completed, etc.
+		// a task is *not invalid* if this task can be started, or caller cannot verify the validity
 		maybeValidate(
 			task *persistencespb.AllocatedTaskInfo,
 			taskType enumspb.TaskQueueType,
@@ -58,7 +63,7 @@ type (
 	}
 
 	taskValidatorImpl struct {
-		newIOContextFn    func() (context.Context, context.CancelFunc)
+		tqCtx             context.Context
 		clusterMetadata   cluster.Metadata
 		namespaceRegistry namespace.Registry
 		historyClient     historyservice.HistoryServiceClient
@@ -68,25 +73,19 @@ type (
 )
 
 func newTaskValidator(
-	newIOContextFn func() (context.Context, context.CancelFunc),
+	tqCtx context.Context,
 	clusterMetadata cluster.Metadata,
 	namespaceRegistry namespace.Registry,
 	historyClient historyservice.HistoryServiceClient,
 ) *taskValidatorImpl {
 	return &taskValidatorImpl{
-		newIOContextFn:    newIOContextFn,
+		tqCtx:             tqCtx,
 		clusterMetadata:   clusterMetadata,
 		namespaceRegistry: namespaceRegistry,
 		historyClient:     historyClient,
 	}
 }
 
-// check if a task has expired / is valid
-// if return false, then task is invalid and should be discarded
-// if return true, then task is *maybe-valid*, and should be dispatched
-//
-// a task is invalid if this task is already failed; timeout; completed, etc
-// a task is *not invalid* if this task can be started, or caller cannot verify the validity
 func (v *taskValidatorImpl) maybeValidate(
 	task *persistencespb.AllocatedTaskInfo,
 	taskType enumspb.TaskQueueType,
@@ -182,7 +181,7 @@ func (v *taskValidatorImpl) isTaskValid(
 	task *persistencespb.AllocatedTaskInfo,
 	taskType enumspb.TaskQueueType,
 ) (bool, error) {
-	ctx, cancel := v.newIOContextFn()
+	ctx, cancel := context.WithTimeout(v.tqCtx, ioTimeout)
 	defer cancel()
 
 	namespaceID := task.Data.NamespaceId

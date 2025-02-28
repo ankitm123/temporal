@@ -33,9 +33,11 @@ import (
 	"go.temporal.io/server/common/definition"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/tasktoken"
 	"go.temporal.io/server/service/history/api"
 	"go.temporal.io/server/service/history/consts"
 	"go.temporal.io/server/service/history/shard"
+	"go.temporal.io/server/service/history/workflow"
 )
 
 func Invoke(
@@ -51,7 +53,7 @@ func Invoke(
 	namespace := namespaceEntry.Name()
 
 	request := req.CancelRequest
-	tokenSerializer := common.NewProtoTaskTokenSerializer()
+	tokenSerializer := tasktoken.NewSerializer()
 	token, err0 := tokenSerializer.Deserialize(request.TaskToken)
 	if err0 != nil {
 		return nil, consts.ErrDeserializingToken
@@ -66,7 +68,6 @@ func Invoke(
 	err = api.GetAndUpdateWorkflowWithNew(
 		ctx,
 		token.Clock,
-		api.BypassMutableStateConsistencyPredicate,
 		definition.NewWorkflowKey(
 			token.NamespaceId,
 			token.WorkflowId,
@@ -132,14 +133,14 @@ func Invoke(
 	)
 
 	if err == nil && !activityStartedTime.IsZero() {
-		metrics.ActivityE2ELatency.With(shard.GetMetricsHandler()).Record(
-			time.Since(activityStartedTime),
-			metrics.OperationTag(metrics.HistoryRespondActivityTaskCanceledScope),
-			metrics.NamespaceTag(namespace.String()),
-			metrics.WorkflowTypeTag(workflowTypeName),
-			metrics.ActivityTypeTag(token.ActivityType),
-			metrics.TaskQueueTag(taskQueue),
-		)
+		metrics.ActivityE2ELatency.With(
+			workflow.GetPerTaskQueueFamilyScope(
+				shard.GetMetricsHandler(), namespace, taskQueue, shard.GetConfig(),
+				metrics.OperationTag(metrics.HistoryRespondActivityTaskCanceledScope),
+				metrics.WorkflowTypeTag(workflowTypeName),
+				metrics.ActivityTypeTag(token.ActivityType),
+			),
+		).Record(time.Since(activityStartedTime))
 	}
 	return &historyservice.RespondActivityTaskCanceledResponse{}, err
 }

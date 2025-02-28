@@ -77,7 +77,6 @@ func SerializeRawHistoryToken(token *tokenspb.RawHistoryContinuation) ([]byte, e
 	if token == nil {
 		return nil, nil
 	}
-
 	return token.Marshal()
 }
 
@@ -93,7 +92,6 @@ func SerializeHistoryToken(token *tokenspb.HistoryContinuation) ([]byte, error) 
 	if token == nil {
 		return nil, nil
 	}
-
 	return token.Marshal()
 }
 

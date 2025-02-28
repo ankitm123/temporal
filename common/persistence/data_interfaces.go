@@ -34,16 +34,14 @@ import (
 	"time"
 
 	"github.com/pborman/uuid"
-	"google.golang.org/protobuf/types/known/timestamppb"
-
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
-
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/service/history/tasks"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // CreateWorkflowMode workflow creation mode
@@ -124,12 +122,16 @@ type (
 
 	// CurrentWorkflowConditionFailedError represents a failed conditional update for current workflow record
 	CurrentWorkflowConditionFailedError struct {
-		Msg              string
-		RequestID        string
+		Msg string
+		// RequestIDs contains all request IDs associated with the workflow execution, ie., contain the
+		// request ID that started the workflow execution as well as the request IDs that were attached
+		// to the workflow execution when it was running.
+		RequestIDs       map[string]*persistencespb.RequestIDInfo
 		RunID            string
 		State            enumsspb.WorkflowExecutionState
 		Status           enumspb.WorkflowExecutionStatus
 		LastWriteVersion int64
+		StartTime        *time.Time
 	}
 
 	// WorkflowConditionFailedError represents a failed conditional update for workflow record
@@ -204,7 +206,6 @@ type (
 
 		NamespaceID string
 		WorkflowID  string
-		RunID       string
 
 		Tasks map[tasks.Category][]tasks.Task
 	}
@@ -525,13 +526,26 @@ type (
 		UserData *persistencespb.VersionedTaskQueueUserData
 	}
 
-	// UpdateTaskQueueUserDataRequest is the input type for the UpdateTaskQueueUserData API
+	// UpdateTaskQueueUserDataRequest is the input type for the UpdateTaskQueueUserData API.
+	// This updates user data for multiple task queues in one namespace.
 	UpdateTaskQueueUserDataRequest struct {
-		NamespaceID     string
-		TaskQueue       string
+		NamespaceID string
+		Updates     map[string]*SingleTaskQueueUserDataUpdate // key is task queue name
+	}
+
+	SingleTaskQueueUserDataUpdate struct {
 		UserData        *persistencespb.VersionedTaskQueueUserData
 		BuildIdsAdded   []string
 		BuildIdsRemoved []string
+		// If Applied is non-nil, and this single update succeeds (while others may have
+		// failed), then it will be set to true.
+		Applied *bool
+		// If Conflicting is non-nil, and this single update fails due to a version conflict,
+		// then it will be set to true. Conflicting updates should not be retried.
+		// Note that even if Conflicting is not set to true, the update may still be
+		// conflicting, because persistence implementations may only be able to identify the
+		// first conflict in a set.
+		Conflicting *bool
 	}
 
 	ListTaskQueueUserDataEntriesRequest struct {
@@ -878,6 +892,8 @@ type (
 		ForkNodeID int64
 		// the info for clean up data in background
 		Info string
+		// the new run ID
+		NewRunID string
 	}
 
 	// ForkHistoryBranchResponse is the response to ForkHistoryBranchRequest
@@ -1020,30 +1036,34 @@ type (
 		MaxRecordsPruned int
 	}
 
-	ListNexusIncomingServicesRequest struct {
+	GetNexusEndpointRequest struct {
+		ID string
+	}
+
+	ListNexusEndpointsRequest struct {
 		LastKnownTableVersion int64
 		NextPageToken         []byte
 		PageSize              int
 	}
 
-	ListNexusIncomingServicesResponse struct {
+	ListNexusEndpointsResponse struct {
 		TableVersion  int64
 		NextPageToken []byte
-		Entries       []*persistencespb.NexusIncomingServiceEntry
+		Entries       []*persistencespb.NexusEndpointEntry
 	}
 
-	CreateOrUpdateNexusIncomingServiceRequest struct {
+	CreateOrUpdateNexusEndpointRequest struct {
 		LastKnownTableVersion int64
-		Entry                 *persistencespb.NexusIncomingServiceEntry
+		Entry                 *persistencespb.NexusEndpointEntry
 	}
 
-	CreateOrUpdateNexusIncomingServiceResponse struct {
+	CreateOrUpdateNexusEndpointResponse struct {
 		Version int64
 	}
 
-	DeleteNexusIncomingServiceRequest struct {
+	DeleteNexusEndpointRequest struct {
 		LastKnownTableVersion int64
-		ServiceID             string
+		ID                    string
 	}
 
 	// Closeable is an interface for any entity that supports a close operation to release resources
@@ -1133,7 +1153,6 @@ type (
 		DeleteTaskQueue(ctx context.Context, request *DeleteTaskQueueRequest) error
 		CreateTasks(ctx context.Context, request *CreateTasksRequest) (*CreateTasksResponse, error)
 		GetTasks(ctx context.Context, request *GetTasksRequest) (*GetTasksResponse, error)
-		CompleteTask(ctx context.Context, request *CompleteTaskRequest) error
 		// CompleteTasksLessThan completes tasks less than or equal to the given task id
 		// This API takes a limit parameter which specifies the count of maxRows that
 		// can be deleted. This parameter may be ignored by the underlying storage, but
@@ -1149,10 +1168,13 @@ type (
 		// This data would only exist if a user uses APIs that generate it, such as the worker versioning related APIs.
 		// The caller should be prepared to gracefully handle the "NotFound" service error.
 		GetTaskQueueUserData(ctx context.Context, request *GetTaskQueueUserDataRequest) (*GetTaskQueueUserDataResponse, error)
-		// UpdateTaskQueueUserData updates the user data for a given task queue.
+		// UpdateTaskQueueUserData updates the user data for a set of task queues in one namespace.
 		// The request takes the _current_ known version along with the data to update.
 		// The caller should +1 increment the cached version number if this call succeeds.
-		// Fails with ConditionFailedError if the user data was updated concurrently.
+		// For efficiency, the store should attempt to perform these updates in as few
+		// transactions as possible.
+		// Returns an error if any individual update fails. The Applied/Conflicting fields of
+		// the individual updates may provide more information in that case.
 		UpdateTaskQueueUserData(ctx context.Context, request *UpdateTaskQueueUserDataRequest) error
 		ListTaskQueueUserDataEntries(ctx context.Context, request *ListTaskQueueUserDataEntriesRequest) (*ListTaskQueueUserDataEntriesResponse, error)
 		GetTaskQueuesByBuildId(ctx context.Context, request *GetTaskQueuesByBuildIdRequest) ([]string, error)
@@ -1188,20 +1210,21 @@ type (
 		DeleteClusterMetadata(ctx context.Context, request *DeleteClusterMetadataRequest) error
 	}
 
-	// NexusIncomingServiceManager is used to manage CRUD for Nexus services
-	NexusIncomingServiceManager interface {
+	// NexusEndpointManager is used to manage CRUD for Nexus endpoints.
+	NexusEndpointManager interface {
 		Closeable
 		GetName() string
-		GetNexusIncomingServicesTableVersion(ctx context.Context) (int64, error)
-		ListNexusIncomingServices(ctx context.Context, request *ListNexusIncomingServicesRequest) (*ListNexusIncomingServicesResponse, error)
-		CreateOrUpdateNexusIncomingService(ctx context.Context, request *CreateOrUpdateNexusIncomingServiceRequest) (*CreateOrUpdateNexusIncomingServiceResponse, error)
-		DeleteNexusIncomingService(ctx context.Context, request *DeleteNexusIncomingServiceRequest) error
+		GetNexusEndpoint(ctx context.Context, request *GetNexusEndpointRequest) (*persistencespb.NexusEndpointEntry, error)
+		ListNexusEndpoints(ctx context.Context, request *ListNexusEndpointsRequest) (*ListNexusEndpointsResponse, error)
+		CreateOrUpdateNexusEndpoint(ctx context.Context, request *CreateOrUpdateNexusEndpointRequest) (*CreateOrUpdateNexusEndpointResponse, error)
+		DeleteNexusEndpoint(ctx context.Context, request *DeleteNexusEndpointRequest) error
 	}
 
 	// HistoryTaskQueueManager is responsible for managing a queue of internal history tasks. This is called a history
 	// task queue manager, but the actual history task queues are not managed by this object. Instead, this object is
 	// responsible for managing a generic queue of history tasks (which is what the history task DLQ is).
 	HistoryTaskQueueManager interface {
+		Closeable
 		EnqueueTask(ctx context.Context, request *EnqueueTaskRequest) (*EnqueueTaskResponse, error)
 		ReadRawTasks(
 			ctx context.Context,
@@ -1216,7 +1239,7 @@ type (
 
 	HistoryTaskQueueManagerImpl struct {
 		queue      QueueV2
-		serializer *serialization.TaskSerializer
+		serializer serialization.Serializer
 	}
 
 	// QueueKey identifies a history task queue. It is converted to a queue name using the GetQueueName method.

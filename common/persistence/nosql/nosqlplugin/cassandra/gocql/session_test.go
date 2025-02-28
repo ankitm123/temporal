@@ -30,10 +30,11 @@ import (
 	"time"
 
 	"github.com/gocql/gocql"
-	"github.com/golang/mock/gomock"
+	"github.com/stretchr/testify/assert"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
+	"go.uber.org/mock/gomock"
 )
 
 func TestSessionEmitsMetricOnRefreshError(t *testing.T) {
@@ -52,6 +53,7 @@ func TestSessionEmitsMetricOnRefreshError(t *testing.T) {
 	metricsHandler.EXPECT().Counter(metrics.CassandraSessionRefreshFailures.Name()).Return(metrics.NoopCounterMetricFunc)
 
 	s.refresh()
+	controller.Finish()
 }
 
 func TestSessionEmitsMetricOnRefreshThrottle(t *testing.T) {
@@ -68,4 +70,14 @@ func TestSessionEmitsMetricOnRefreshThrottle(t *testing.T) {
 	metricsHandler.EXPECT().Counter(metrics.CassandraSessionRefreshFailures.Name()).Return(metrics.NoopCounterMetricFunc)
 
 	s.refresh()
+	controller.Finish()
+}
+
+func TestPanicCapture(t *testing.T) {
+	_, err := initSession(log.NewNoopLogger(), func() (*gocql.ClusterConfig, error) {
+		return &gocql.ClusterConfig{Hosts: []string{"0.0.0.0"}}, nil
+	}, metrics.NoopMetricsHandler)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "panic:")
 }

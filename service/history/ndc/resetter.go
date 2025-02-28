@@ -22,8 +22,6 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination workflow_resetter_mock.go
-
 package ndc
 
 import (
@@ -32,7 +30,6 @@ import (
 
 	"github.com/pborman/uuid"
 	"go.temporal.io/api/serviceerror"
-
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/definition"
 	"go.temporal.io/server/common/log"
@@ -156,6 +153,10 @@ func (r *resetterImpl) resetWorkflow(
 	}
 	rebuildMutableState.AddHistorySize(rebuiltHistorySize)
 
+	if err := rebuildMutableState.RefreshExpirationTimeoutTask(ctx); err != nil {
+		return nil, err
+	}
+
 	r.newContext.Clear()
 	return rebuildMutableState, nil
 }
@@ -236,6 +237,7 @@ func (r *resetterImpl) getResetBranchToken(
 		Info:            persistence.BuildHistoryGarbageCleanupInfo(r.namespaceID.String(), r.workflowID, r.newRunID),
 		ShardID:         shardID,
 		NamespaceID:     r.namespaceID.String(),
+		NewRunID:        r.newRunID,
 	})
 	if err != nil {
 		return nil, err

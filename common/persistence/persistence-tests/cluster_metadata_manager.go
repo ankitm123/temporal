@@ -33,7 +33,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/api/serviceerror"
 	versionpb "go.temporal.io/api/version/v1"
-
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common/debug"
 	p "go.temporal.io/server/common/persistence"
@@ -66,6 +65,9 @@ func (s *ClusterMetadataManagerSuite) SetupTest() {
 
 // TearDownTest implementation
 func (s *ClusterMetadataManagerSuite) TearDownTest() {
+	// Ensure all tests clean up after themselves
+	// Todo: MetaMgr should provide api to clear all members
+	s.waitForPrune(1 * time.Second)
 	s.cancel()
 }
 
@@ -101,16 +103,12 @@ func (s *ClusterMetadataManagerSuite) TestClusterMembershipUpsertCanReadAny() {
 	s.Nil(err)
 	s.NotNil(resp)
 	s.NotEmpty(resp.ActiveMembers)
+
+	s.waitForPrune(5 * time.Second)
 }
 
 // TestClusterMembershipUpsertCanRead verifies that we can UpsertClusterMembership and read our result
 func (s *ClusterMetadataManagerSuite) TestClusterMembershipUpsertCanPageRead() {
-	// Expire previous records
-	// Todo: MetaMgr should provide api to clear all members
-	time.Sleep(time.Second * 3)
-	err := s.ClusterMetadataManager.PruneClusterMembership(s.ctx, &p.PruneClusterMembershipRequest{MaxRecordsPruned: 100})
-	s.Nil(err)
-
 	expectedIds := make(map[string]int, 100)
 	for i := 0; i < 100; i++ {
 		hostID := primitives.NewUUID().Downcast()
@@ -149,9 +147,7 @@ func (s *ClusterMetadataManagerSuite) TestClusterMembershipUpsertCanPageRead() {
 		s.Zero(val, "identifier was either not found in db, or shouldn't be there - "+id)
 	}
 
-	time.Sleep(time.Second * 3)
-	err = s.ClusterMetadataManager.PruneClusterMembership(s.ctx, &p.PruneClusterMembershipRequest{MaxRecordsPruned: 1000})
-	s.NoError(err)
+	s.waitForPrune(5 * time.Second)
 }
 
 func (s *ClusterMetadataManagerSuite) validateUpsert(req *p.UpsertClusterMembershipRequest, resp *p.GetClusterMembersResponse, err error) {
@@ -224,10 +220,7 @@ func (s *ClusterMetadataManagerSuite) TestClusterMembershipReadFiltersCorrectly(
 	)
 
 	s.validateUpsert(req, resp, err)
-
-	time.Sleep(time.Second * 3)
-	err = s.ClusterMetadataManager.PruneClusterMembership(s.ctx, &p.PruneClusterMembershipRequest{MaxRecordsPruned: 1000})
-	s.NoError(err)
+	s.waitForPrune(5 * time.Second)
 }
 
 // TestClusterMembershipUpsertExpiresCorrectly verifies RecordExpiry functions properly for ClusterMembership records
@@ -264,19 +257,27 @@ func (s *ClusterMetadataManagerSuite) TestClusterMembershipUpsertExpiresCorrectl
 	s.Equal(resp.ActiveMembers[0].HostID, req.HostID)
 	s.Equal(resp.ActiveMembers[0].Role, req.Role)
 
-	time.Sleep(time.Second * 2)
+	s.waitForPrune(5 * time.Second)
+}
 
-	err = s.ClusterMetadataManager.PruneClusterMembership(s.ctx, &p.PruneClusterMembershipRequest{MaxRecordsPruned: 100})
-	s.Nil(err)
+// waitForPrune waits up for the persistence backend to prune all records. Some persistence backends
+// may not remove TTL'd entries at the exact instant they should expire, so we allow some timing flexibility here.
+func (s *ClusterMetadataManagerSuite) waitForPrune(waitFor time.Duration) {
+	s.Eventually(func() bool {
+		err := s.ClusterMetadataManager.PruneClusterMembership(s.ctx, &p.PruneClusterMembershipRequest{MaxRecordsPruned: 100})
+		s.Nil(err)
 
-	resp, err = s.ClusterMetadataManager.GetClusterMembers(
-		s.ctx,
-		&p.GetClusterMembersRequest{LastHeartbeatWithin: time.Minute * 10},
-	)
+		resp, err := s.ClusterMetadataManager.GetClusterMembers(
+			s.ctx,
+			&p.GetClusterMembersRequest{LastHeartbeatWithin: time.Minute * 10},
+		)
+		s.NoError(err)
+		s.NotNil(resp)
+		return len(resp.ActiveMembers) == 0
 
-	s.Nil(err)
-	s.NotNil(resp)
-	s.Empty(resp.ActiveMembers)
+	},
+		waitFor,
+		500*time.Millisecond)
 }
 
 // TestClusterMembershipUpsertInvalidExpiry verifies we cannot specify a non-positive RecordExpiry duration
@@ -308,6 +309,7 @@ func (s *ClusterMetadataManagerSuite) TestInitImmutableMetadataReadWrite() {
 	historyShardsToPersist := int32(43)
 	clusterIdToPersist := "12345"
 	clusterAddress := "cluster-address"
+	clusterHttpAddress := "cluster-http-address"
 	failoverVersionIncrement := int64(10)
 	initialFailoverVersion := int64(1)
 
@@ -331,6 +333,7 @@ func (s *ClusterMetadataManagerSuite) TestInitImmutableMetadataReadWrite() {
 				HistoryShardCount:        historyShardsToPersist,
 				ClusterId:                clusterIdToPersist,
 				ClusterAddress:           clusterAddress,
+				HttpAddress:              clusterHttpAddress,
 				FailoverVersionIncrement: failoverVersionIncrement,
 				InitialFailoverVersion:   initialFailoverVersion,
 				IsGlobalNamespaceEnabled: true,
@@ -351,6 +354,7 @@ func (s *ClusterMetadataManagerSuite) TestInitImmutableMetadataReadWrite() {
 	s.Equal(historyShardsToPersist, getResp.HistoryShardCount)
 	s.Equal(clusterIdToPersist, getResp.ClusterId)
 	s.Equal(clusterAddress, getResp.ClusterAddress)
+	s.Equal(clusterHttpAddress, getResp.HttpAddress)
 	s.Equal(failoverVersionIncrement, getResp.FailoverVersionIncrement)
 	s.Equal(initialFailoverVersion, getResp.InitialFailoverVersion)
 	s.True(getResp.IsGlobalNamespaceEnabled)
@@ -377,6 +381,7 @@ func (s *ClusterMetadataManagerSuite) TestInitImmutableMetadataReadWrite() {
 	s.Equal(historyShardsToPersist, getResp.HistoryShardCount)
 	s.Equal(clusterIdToPersist, getResp.ClusterId)
 	s.Equal(clusterAddress, getResp.ClusterAddress)
+	s.Equal(clusterHttpAddress, getResp.HttpAddress)
 	s.Equal(failoverVersionIncrement, getResp.FailoverVersionIncrement)
 	s.Equal(initialFailoverVersion, getResp.InitialFailoverVersion)
 	s.True(getResp.IsGlobalNamespaceEnabled)
@@ -419,6 +424,7 @@ func (s *ClusterMetadataManagerSuite) TestInitImmutableMetadataReadWrite() {
 				HistoryShardCount:        historyShardsToPersist,
 				ClusterId:                clusterIdToPersist,
 				ClusterAddress:           clusterAddress,
+				HttpAddress:              clusterHttpAddress,
 				FailoverVersionIncrement: failoverVersionIncrement,
 				InitialFailoverVersion:   initialFailoverVersion,
 				IsGlobalNamespaceEnabled: true,
@@ -438,6 +444,7 @@ func (s *ClusterMetadataManagerSuite) TestInitImmutableMetadataReadWrite() {
 	s.Equal(historyShardsToPersist, getResp.HistoryShardCount)
 	s.Equal(clusterIdToPersist, getResp.ClusterId)
 	s.Equal(clusterAddress, getResp.ClusterAddress)
+	s.Equal(clusterHttpAddress, getResp.HttpAddress)
 	s.Equal(failoverVersionIncrement, getResp.FailoverVersionIncrement)
 	s.Equal(initialFailoverVersion, getResp.InitialFailoverVersion)
 	s.True(getResp.IsGlobalNamespaceEnabled)
@@ -471,6 +478,7 @@ func (s *ClusterMetadataManagerSuite) TestInitImmutableMetadataReadWrite() {
 				HistoryShardCount:        historyShardsToPersist,
 				ClusterId:                clusterIdToPersist,
 				ClusterAddress:           clusterAddress,
+				HttpAddress:              clusterHttpAddress,
 				FailoverVersionIncrement: failoverVersionIncrement,
 				InitialFailoverVersion:   initialFailoverVersion,
 				IsGlobalNamespaceEnabled: true,

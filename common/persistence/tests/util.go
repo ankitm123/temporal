@@ -26,24 +26,22 @@ package tests
 
 import (
 	"math/rand"
+	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	commonpb "go.temporal.io/api/common/v1"
+	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	workflowpb "go.temporal.io/api/workflow/v1"
-	"google.golang.org/protobuf/types/known/durationpb"
-	"google.golang.org/protobuf/types/known/timestamppb"
-
-	enumspb "go.temporal.io/api/enums/v1"
-
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	historyspb "go.temporal.io/server/api/history/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	p "go.temporal.io/server/common/persistence"
-	"go.temporal.io/server/common/shuffle"
 	"go.temporal.io/server/common/testing/fakedata"
 	"go.temporal.io/server/service/history/tasks"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func RandomShardInfo(
@@ -61,16 +59,18 @@ func RandomSnapshot(
 	namespaceID string,
 	workflowID string,
 	runID string,
+	eventID int64,
 	lastWriteVersion int64,
 	state enumsspb.WorkflowExecutionState,
 	status enumspb.WorkflowExecutionStatus,
 	dbRecordVersion int64,
-) *p.WorkflowSnapshot {
-	return &p.WorkflowSnapshot{
-		ExecutionInfo:  RandomExecutionInfo(namespaceID, workflowID, lastWriteVersion),
+	branchToken []byte,
+) (*p.WorkflowSnapshot, []*p.WorkflowEvents) {
+	snapshot := &p.WorkflowSnapshot{
+		ExecutionInfo:  RandomExecutionInfo(namespaceID, workflowID, eventID, lastWriteVersion, branchToken),
 		ExecutionState: RandomExecutionState(runID, state, status),
 
-		NextEventID: rand.Int63(),
+		NextEventID: eventID + 1, // NOTE: RandomSnapshot generates a single history event, hence NextEventID is plus 1
 
 		ActivityInfos:       RandomInt64ActivityInfoMap(),
 		TimerInfos:          RandomStringTimerInfoMap(),
@@ -89,22 +89,34 @@ func RandomSnapshot(
 		Condition:       rand.Int63(),
 		DBRecordVersion: dbRecordVersion,
 	}
+	history := snapshot.ExecutionInfo.VersionHistories.Histories[0]
+	events := &p.WorkflowEvents{
+		NamespaceID: namespaceID,
+		WorkflowID:  workflowID,
+		RunID:       runID,
+		BranchToken: history.BranchToken,
+		Events:      []*historypb.HistoryEvent{RandomHistoryEvent(eventID, lastWriteVersion)},
+	}
+	return snapshot, []*p.WorkflowEvents{events}
 }
 
 func RandomMutation(
+	t *testing.T,
 	namespaceID string,
 	workflowID string,
 	runID string,
+	eventID int64,
 	lastWriteVersion int64,
 	state enumsspb.WorkflowExecutionState,
 	status enumspb.WorkflowExecutionStatus,
 	dbRecordVersion int64,
-) *p.WorkflowMutation {
+	branchToken []byte,
+) (*p.WorkflowMutation, []*p.WorkflowEvents) {
 	mutation := &p.WorkflowMutation{
-		ExecutionInfo:  RandomExecutionInfo(namespaceID, workflowID, lastWriteVersion),
+		ExecutionInfo:  RandomExecutionInfo(namespaceID, workflowID, eventID, lastWriteVersion, branchToken),
 		ExecutionState: RandomExecutionState(runID, state, status),
 
-		NextEventID: rand.Int63(),
+		NextEventID: eventID + 1, // NOTE: RandomMutation generates a single history event, hence NextEventID is plus 1
 
 		UpsertActivityInfos:       RandomInt64ActivityInfoMap(),
 		DeleteActivityInfos:       map[int64]struct{}{rand.Int63(): {}},
@@ -141,23 +153,35 @@ func RandomMutation(
 		mutation.NewBufferedEvents = nil
 	case 2:
 		mutation.ClearBufferedEvents = false
-		mutation.NewBufferedEvents = []*historypb.HistoryEvent{RandomHistoryEvent()}
+		mutation.NewBufferedEvents = []*historypb.HistoryEvent{RandomHistoryEvent(eventID, lastWriteVersion)}
 	default:
 		panic("broken test")
 	}
-	return mutation
+
+	history := mutation.ExecutionInfo.VersionHistories.Histories[0]
+	events := &p.WorkflowEvents{
+		NamespaceID: namespaceID,
+		WorkflowID:  workflowID,
+		RunID:       runID,
+		BranchToken: history.BranchToken,
+		Events:      []*historypb.HistoryEvent{RandomHistoryEvent(eventID, lastWriteVersion)},
+	}
+
+	return mutation, []*p.WorkflowEvents{events}
 }
 
 func RandomExecutionInfo(
 	namespaceID string,
 	workflowID string,
+	eventID int64,
 	lastWriteVersion int64,
+	branchToken []byte,
 ) *persistencespb.WorkflowExecutionInfo {
 	var executionInfo persistencespb.WorkflowExecutionInfo
 	_ = fakedata.FakeStruct(&executionInfo)
 	executionInfo.NamespaceId = namespaceID
 	executionInfo.WorkflowId = workflowID
-	executionInfo.VersionHistories = RandomVersionHistory(lastWriteVersion)
+	executionInfo.VersionHistories = RandomVersionHistory(eventID, lastWriteVersion, branchToken)
 	return &executionInfo
 }
 
@@ -166,11 +190,20 @@ func RandomExecutionState(
 	state enumsspb.WorkflowExecutionState,
 	status enumspb.WorkflowExecutionStatus,
 ) *persistencespb.WorkflowExecutionState {
+	createRequestID := uuid.NewString()
 	return &persistencespb.WorkflowExecutionState{
-		CreateRequestId: uuid.New().String(),
+		CreateRequestId: createRequestID,
 		RunId:           runID,
 		State:           state,
 		Status:          status,
+		RequestIds: map[string]*persistencespb.RequestIDInfo{
+			createRequestID: {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+			},
+			uuid.NewString(): {
+				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
+			},
+		},
 	}
 }
 
@@ -234,9 +267,11 @@ func RandomSignalInfo() *persistencespb.SignalInfo {
 	return &signalInfo
 }
 
-func RandomHistoryEvent() *historypb.HistoryEvent {
+func RandomHistoryEvent(eventID int64, version int64) *historypb.HistoryEvent {
 	var historyEvent historypb.HistoryEvent
 	_ = fakedata.FakeStruct(&historyEvent)
+	historyEvent.EventId = eventID
+	historyEvent.Version = version
 	return &historyEvent
 }
 
@@ -264,18 +299,40 @@ func RandomPayload() *commonpb.Payload {
 }
 
 func RandomVersionHistory(
+	eventID int64,
 	lastWriteVersion int64,
+	branchToken []byte,
 ) *historyspb.VersionHistories {
 	return &historyspb.VersionHistories{
 		CurrentVersionHistoryIndex: 0,
 		Histories: []*historyspb.VersionHistory{{
-			BranchToken: shuffle.Bytes([]byte("random branch token")),
+			BranchToken: branchToken,
 			Items: []*historyspb.VersionHistoryItem{{
-				EventId: rand.Int63(),
+				EventId: eventID,
 				Version: lastWriteVersion,
 			}},
 		}},
 	}
+}
+
+func RandomBranchToken(
+	namespaceID string,
+	workflowID string,
+	runID string,
+	historyBranchUtil p.HistoryBranchUtil,
+) []byte {
+	branchToken, _ := historyBranchUtil.NewHistoryBranch(
+		namespaceID,
+		workflowID,
+		runID,
+		uuid.NewString(),
+		nil,
+		nil,
+		0,
+		0,
+		0,
+	)
+	return branchToken
 }
 
 func RandomTime() *timestamppb.Timestamp {

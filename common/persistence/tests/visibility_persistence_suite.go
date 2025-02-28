@@ -29,14 +29,12 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/require"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
-
 	"go.temporal.io/server/common/debug"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log/tag"
@@ -50,6 +48,7 @@ import (
 	"go.temporal.io/server/common/primitives/timestamp"
 	"go.temporal.io/server/common/resolver"
 	"go.temporal.io/server/common/searchattribute"
+	"go.uber.org/mock/gomock"
 )
 
 type (
@@ -60,7 +59,12 @@ type (
 		*require.Assertions
 		controller *gomock.Controller
 
+		// TaskID is monotonic increasing every time a request is created using createOpenWorkflowRecord
+		// and createClosedWorkflowRecord. It tries to simulate the real task ID.
+		taskID int64
+
 		*persistencetests.TestBase
+		NamespaceRegistry              namespace.Registry
 		VisibilityMgr                  manager.VisibilityManager
 		SearchAttributesProvider       searchattribute.Provider
 		SearchAttributesMapperProvider searchattribute.MapperProvider
@@ -80,18 +84,21 @@ func (s *VisibilityPersistenceSuite) SetupSuite() {
 	s.controller = gomock.NewController(s.T())
 	s.SearchAttributesProvider = searchattribute.NewTestProvider()
 	s.SearchAttributesMapperProvider = searchattribute.NewTestMapperProvider(nil)
+	s.NamespaceRegistry = namespace.NewMockRegistry(s.controller)
 	s.VisibilityMgr, err = visibility.NewManager(
 		cfg,
 		resolver.NewNoopResolver(),
 		s.CustomVisibilityStoreFactory,
 		nil,
-		nil,
 		s.SearchAttributesProvider,
 		s.SearchAttributesMapperProvider,
+		s.NamespaceRegistry,
 		dynamicconfig.GetIntPropertyFn(1000),
 		dynamicconfig.GetIntPropertyFn(1000),
 		dynamicconfig.GetFloatPropertyFn(0.2),
+		dynamicconfig.GetDurationPropertyFn(time.Second),
 		dynamicconfig.GetBoolPropertyFnFilteredByNamespace(false),
+		dynamicconfig.GetBoolPropertyFn(false),
 		dynamicconfig.GetStringPropertyFn(visibility.SecondaryVisibilityWritingModeOff),
 		dynamicconfig.GetBoolPropertyFnFilteredByNamespace(false),
 		dynamicconfig.GetBoolPropertyFnFilteredByNamespace(true),
@@ -126,34 +133,66 @@ func (s *VisibilityPersistenceSuite) TearDownSuite() {
 func (s *VisibilityPersistenceSuite) TestBasicVisibility() {
 	testNamespaceUUID := namespace.ID(uuid.New())
 	startTime := time.Now().UTC().Add(time.Second * -5)
-	startReq := s.createOpenWorkflowRecord(testNamespaceUUID, "visibility-workflow-test", "visibility-workflow", startTime, "test-queue")
+	startReq := s.createOpenWorkflowRecord(
+		testNamespaceUUID,
+		"visibility-workflow-test",
+		"visibility-workflow",
+		startTime,
+		startTime,
+		"test-queue",
+	)
 
-	resp, err1 := s.VisibilityMgr.ListOpenWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		PageSize:          1,
-		EarliestStartTime: startTime,
-		LatestStartTime:   startTime,
+	// ListOpenWorkflowExecutions
+	resp, err1 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    1,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s = '%s'",
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		),
 	})
 	s.Nil(err1)
 	s.Equal(1, len(resp.Executions))
 	s.assertOpenExecutionEquals(startReq, resp.Executions[0])
 
-	closeReq := s.createClosedWorkflowRecord(startReq, time.Now())
+	closeReq := s.createClosedWorkflowRecord(
+		startReq,
+		time.Now(),
+		enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+	)
 
-	resp, err3 := s.VisibilityMgr.ListOpenWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		PageSize:          1,
-		EarliestStartTime: startTime,
-		LatestStartTime:   startTime,
+	// ListOpenWorkflowExecutions
+	resp, err3 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    1,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s = '%s'",
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		),
 	})
 	s.Nil(err3)
 	s.Equal(0, len(resp.Executions))
 
-	resp, err4 := s.VisibilityMgr.ListClosedWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		PageSize:          1,
-		EarliestStartTime: startTime,
-		LatestStartTime:   time.Now(),
+	// ListClosedWorkflowExecutions
+	resp, err4 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    1,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s != '%s'",
+			searchattribute.CloseTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.CloseTime,
+			time.Now().Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		),
 	})
 	s.Nil(err4)
 	s.Equal(1, len(resp.Executions))
@@ -165,34 +204,66 @@ func (s *VisibilityPersistenceSuite) TestBasicVisibilityTimeSkew() {
 	testNamespaceUUID := namespace.ID(uuid.New())
 
 	startTime := time.Now()
-	openRecord := s.createOpenWorkflowRecord(testNamespaceUUID, "visibility-workflow-test-time-skew", "visibility-workflow", startTime, "test-queue")
+	openRecord := s.createOpenWorkflowRecord(
+		testNamespaceUUID,
+		"visibility-workflow-test-time-skew",
+		"visibility-workflow",
+		startTime,
+		startTime,
+		"test-queue",
+	)
 
-	resp, err1 := s.VisibilityMgr.ListOpenWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		PageSize:          1,
-		EarliestStartTime: startTime,
-		LatestStartTime:   startTime,
+	// ListOpenWorkflowExecutions
+	resp, err1 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    1,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s = '%s'",
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		),
 	})
 	s.NoError(err1)
 	s.Equal(1, len(resp.Executions))
 	s.assertOpenExecutionEquals(openRecord, resp.Executions[0])
 
-	closedRecord := s.createClosedWorkflowRecord(openRecord, startTime.Add(-10*time.Millisecond))
+	closedRecord := s.createClosedWorkflowRecord(
+		openRecord,
+		startTime.Add(-10*time.Millisecond),
+		enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+	)
 
-	resp, err3 := s.VisibilityMgr.ListOpenWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		PageSize:          1,
-		EarliestStartTime: startTime,
-		LatestStartTime:   startTime,
+	// ListOpenWorkflowExecutions
+	resp, err3 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    1,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s = '%s'",
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		),
 	})
 	s.NoError(err3)
 	s.Equal(0, len(resp.Executions))
 
-	resp, err4 := s.VisibilityMgr.ListClosedWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		PageSize:          1,
-		EarliestStartTime: startTime.Add(-10 * time.Millisecond), // This is actually close_time
-		LatestStartTime:   startTime.Add(-10 * time.Millisecond),
+	// ListClosedWorkflowExecutions
+	resp, err4 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    1,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s != '%s'",
+			searchattribute.CloseTime,
+			startTime.Add(-10*time.Millisecond).Format(time.RFC3339Nano),
+			searchattribute.CloseTime,
+			startTime.Add(-10*time.Millisecond).Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		),
 	})
 	s.NoError(err4)
 	s.Equal(1, len(resp.Executions))
@@ -203,23 +274,48 @@ func (s *VisibilityPersistenceSuite) TestBasicVisibilityShortWorkflow() {
 	testNamespaceUUID := namespace.ID(uuid.New())
 
 	startTime := time.Now().UTC()
-	openRecord := s.createOpenWorkflowRecord(testNamespaceUUID, "visibility-workflow-test-short-workflow", "visibility-workflow", startTime, "test-queue")
-	closedRecord := s.createClosedWorkflowRecord(openRecord, startTime.Add(10*time.Millisecond))
+	openRecord := s.createOpenWorkflowRecord(
+		testNamespaceUUID,
+		"visibility-workflow-test-short-workflow",
+		"visibility-workflow",
+		startTime,
+		startTime,
+		"test-queue",
+	)
+	closedRecord := s.createClosedWorkflowRecord(
+		openRecord,
+		startTime.Add(10*time.Millisecond),
+		enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+	)
 
-	resp, err3 := s.VisibilityMgr.ListOpenWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		PageSize:          1,
-		EarliestStartTime: startTime,
-		LatestStartTime:   startTime,
+	// ListOpenWorkflowExecutions
+	resp, err3 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    1,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s = '%s'",
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		),
 	})
 	s.NoError(err3)
 	s.Equal(0, len(resp.Executions))
 
-	resp, err4 := s.VisibilityMgr.ListClosedWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		PageSize:          1,
-		EarliestStartTime: startTime.Add(10 * time.Millisecond), // This is actually close_time
-		LatestStartTime:   startTime.Add(10 * time.Millisecond),
+	// ListClosedWorkflowExecutions
+	resp, err4 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    1,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s != '%s'",
+			searchattribute.CloseTime,
+			startTime.Add(10*time.Millisecond).Format(time.RFC3339Nano),
+			searchattribute.CloseTime,
+			startTime.Add(10*time.Millisecond).Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		),
 	})
 	s.NoError(err4)
 	s.Equal(1, len(resp.Executions))
@@ -232,29 +328,55 @@ func (s *VisibilityPersistenceSuite) TestVisibilityPagination() {
 
 	// Create 2 executions
 	startTime1 := time.Now().UTC()
-	openRecord1 := s.createOpenWorkflowRecord(testNamespaceUUID, "visibility-pagination-test1", "visibility-workflow", startTime1, "test-queue")
+	openRecord1 := s.createOpenWorkflowRecord(
+		testNamespaceUUID,
+		"visibility-pagination-test1",
+		"visibility-workflow",
+		startTime1,
+		startTime1,
+		"test-queue",
+	)
 
 	startTime2 := startTime1.Add(time.Second)
-	openRecord2 := s.createOpenWorkflowRecord(testNamespaceUUID, "visibility-pagination-test2", "visibility-workflow", startTime2, "test-queue")
+	openRecord2 := s.createOpenWorkflowRecord(
+		testNamespaceUUID,
+		"visibility-pagination-test2",
+		"visibility-workflow",
+		startTime2,
+		startTime2,
+		"test-queue",
+	)
 
 	// Get the first one
-	resp, err2 := s.VisibilityMgr.ListOpenWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		PageSize:          1,
-		EarliestStartTime: startTime1,
-		LatestStartTime:   startTime2,
+	resp, err2 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    1,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s = '%s'",
+			searchattribute.StartTime,
+			startTime1.Format(time.RFC3339Nano),
+			searchattribute.StartTime,
+			startTime2.Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		),
 	})
 	s.Nil(err2)
 	s.Equal(1, len(resp.Executions))
 	s.assertOpenExecutionEquals(openRecord2, resp.Executions[0])
 
 	// Use token to get the second one
-	resp, err3 := s.VisibilityMgr.ListOpenWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		PageSize:          1,
-		EarliestStartTime: startTime1,
-		LatestStartTime:   startTime2,
-		NextPageToken:     resp.NextPageToken,
+	resp, err3 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    1,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s = '%s'",
+			searchattribute.StartTime,
+			startTime1.Format(time.RFC3339Nano),
+			searchattribute.StartTime,
+			startTime2.Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		),
+		NextPageToken: resp.NextPageToken,
 	})
 	s.Nil(err3)
 	s.Equal(1, len(resp.Executions))
@@ -263,12 +385,18 @@ func (s *VisibilityPersistenceSuite) TestVisibilityPagination() {
 	// It is possible to not return non empty token which is going to return empty result
 	if len(resp.NextPageToken) != 0 {
 		// Now should get empty result by using token
-		resp, err4 := s.VisibilityMgr.ListOpenWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-			NamespaceID:       testNamespaceUUID,
-			PageSize:          1,
-			EarliestStartTime: startTime1,
-			LatestStartTime:   startTime2,
-			NextPageToken:     resp.NextPageToken,
+		resp, err4 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+			NamespaceID: testNamespaceUUID,
+			PageSize:    1,
+			Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s = '%s'",
+				searchattribute.StartTime,
+				startTime1.Format(time.RFC3339Nano),
+				searchattribute.StartTime,
+				startTime2.Format(time.RFC3339Nano),
+				searchattribute.ExecutionStatus,
+				enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+			),
+			NextPageToken: resp.NextPageToken,
 		})
 		s.Nil(err4)
 		s.Equal(0, len(resp.Executions))
@@ -281,15 +409,35 @@ func (s *VisibilityPersistenceSuite) TestFilteringByStartTime() {
 	startTime := time.Now()
 
 	// Create 2 open workflows, one started 2hrs ago, the other started just now.
-	openRecord1 := s.createOpenWorkflowRecord(testNamespaceUUID, "visibility-filtering-test1", "visibility-workflow-1", startTime.Add(-2*time.Hour), "test-queue")
-	openRecord2 := s.createOpenWorkflowRecord(testNamespaceUUID, "visibility-filtering-test2", "visibility-workflow-2", startTime, "test-queue")
+	openRecord1 := s.createOpenWorkflowRecord(
+		testNamespaceUUID,
+		"visibility-filtering-test1",
+		"visibility-workflow-1",
+		startTime.Add(-2*time.Hour),
+		startTime.Add(-2*time.Hour),
+		"test-queue",
+	)
+	openRecord2 := s.createOpenWorkflowRecord(
+		testNamespaceUUID,
+		"visibility-filtering-test2",
+		"visibility-workflow-2",
+		startTime,
+		startTime,
+		"test-queue",
+	)
 
 	// List open workflows with start time filter
-	resp, err := s.VisibilityMgr.ListOpenWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		PageSize:          2,
-		EarliestStartTime: time.Now().Add(-time.Hour),
-		LatestStartTime:   time.Now(),
+	resp, err := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    2,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s = '%s'",
+			searchattribute.StartTime,
+			time.Now().Add(-time.Hour).Format(time.RFC3339Nano),
+			searchattribute.StartTime,
+			time.Now().Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		),
 	})
 	s.NoError(err)
 	s.Equal(1, len(resp.Executions))
@@ -331,18 +479,37 @@ func (s *VisibilityPersistenceSuite) TestFilteringByType() {
 	startTime := time.Now()
 
 	// Create 2 executions
-	openRecord1 := s.createOpenWorkflowRecord(testNamespaceUUID, "visibility-filtering-test1", "visibility-workflow-1", startTime, "test-queue")
-	openRecord2 := s.createOpenWorkflowRecord(testNamespaceUUID, "visibility-filtering-test2", "visibility-workflow-2", startTime, "test-queue")
+	openRecord1 := s.createOpenWorkflowRecord(
+		testNamespaceUUID,
+		"visibility-filtering-test1",
+		"visibility-workflow-1",
+		startTime,
+		startTime,
+		"test-queue",
+	)
+	openRecord2 := s.createOpenWorkflowRecord(
+		testNamespaceUUID,
+		"visibility-filtering-test2",
+		"visibility-workflow-2",
+		startTime,
+		startTime,
+		"test-queue",
+	)
 
-	// List open with filtering
-	resp, err2 := s.VisibilityMgr.ListOpenWorkflowExecutionsByType(s.ctx, &manager.ListWorkflowExecutionsByTypeRequest{
-		ListWorkflowExecutionsRequest: &manager.ListWorkflowExecutionsRequest{
-			NamespaceID:       testNamespaceUUID,
-			PageSize:          2,
-			EarliestStartTime: startTime,
-			LatestStartTime:   startTime,
-		},
-		WorkflowTypeName: "visibility-workflow-1",
+	// List open with filtering: ListOpenWorkflowExecutionsByType
+	resp, err2 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    2,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s = '%s' AND %s = '%s'",
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+			searchattribute.WorkflowType,
+			"visibility-workflow-1",
+		),
 	})
 	s.Nil(err2)
 	s.Equal(1, len(resp.Executions))
@@ -359,18 +526,27 @@ func (s *VisibilityPersistenceSuite) TestFilteringByType() {
 	s.assertOpenExecutionEquals(openRecord1, resp.Executions[0])
 
 	// Close both executions
-	s.createClosedWorkflowRecord(openRecord1, time.Now())
-	closedRecord2 := s.createClosedWorkflowRecord(openRecord2, time.Now())
+	s.createClosedWorkflowRecord(openRecord1, time.Now(), enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED)
+	closedRecord2 := s.createClosedWorkflowRecord(
+		openRecord2,
+		time.Now(),
+		enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+	)
 
-	// List closed with filtering
-	resp, err5 := s.VisibilityMgr.ListClosedWorkflowExecutionsByType(s.ctx, &manager.ListWorkflowExecutionsByTypeRequest{
-		ListWorkflowExecutionsRequest: &manager.ListWorkflowExecutionsRequest{
-			NamespaceID:       testNamespaceUUID,
-			PageSize:          2,
-			EarliestStartTime: startTime,
-			LatestStartTime:   time.Now(),
-		},
-		WorkflowTypeName: "visibility-workflow-2",
+	// List closed with filtering: ListClosedWorkflowExecutionsByType
+	resp, err5 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    2,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s != '%s' AND %s = '%s'",
+			searchattribute.CloseTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.CloseTime,
+			time.Now().Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+			searchattribute.WorkflowType,
+			"visibility-workflow-2",
+		),
 	})
 	s.Nil(err5)
 	s.Equal(1, len(resp.Executions))
@@ -393,18 +569,37 @@ func (s *VisibilityPersistenceSuite) TestFilteringByWorkflowID() {
 	startTime := time.Now()
 
 	// Create 2 executions
-	openRecord1 := s.createOpenWorkflowRecord(testNamespaceUUID, "visibility-filtering-test1", "visibility-workflow", startTime, "test-queue")
-	openRecord2 := s.createOpenWorkflowRecord(testNamespaceUUID, "visibility-filtering-test2", "visibility-workflow", startTime, "test-queue")
+	openRecord1 := s.createOpenWorkflowRecord(
+		testNamespaceUUID,
+		"visibility-filtering-test1",
+		"visibility-workflow",
+		startTime,
+		startTime,
+		"test-queue",
+	)
+	openRecord2 := s.createOpenWorkflowRecord(
+		testNamespaceUUID,
+		"visibility-filtering-test2",
+		"visibility-workflow",
+		startTime,
+		startTime,
+		"test-queue",
+	)
 
-	// List open with filtering
-	resp, err2 := s.VisibilityMgr.ListOpenWorkflowExecutionsByWorkflowID(s.ctx, &manager.ListWorkflowExecutionsByWorkflowIDRequest{
-		ListWorkflowExecutionsRequest: &manager.ListWorkflowExecutionsRequest{
-			NamespaceID:       testNamespaceUUID,
-			PageSize:          2,
-			EarliestStartTime: startTime,
-			LatestStartTime:   startTime,
-		},
-		WorkflowID: "visibility-filtering-test1",
+	// List open with filtering: ListOpenWorkflowExecutionsByWorkflowID
+	resp, err2 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    2,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s = '%s' AND %s = '%s'",
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+			searchattribute.WorkflowID,
+			"visibility-filtering-test1",
+		),
 	})
 	s.Nil(err2)
 	s.Equal(1, len(resp.Executions))
@@ -421,18 +616,27 @@ func (s *VisibilityPersistenceSuite) TestFilteringByWorkflowID() {
 	s.assertOpenExecutionEquals(openRecord1, resp.Executions[0])
 
 	// Close both executions
-	s.createClosedWorkflowRecord(openRecord1, time.Now())
-	closedRecord2 := s.createClosedWorkflowRecord(openRecord2, time.Now())
+	s.createClosedWorkflowRecord(openRecord1, time.Now(), enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED)
+	closedRecord2 := s.createClosedWorkflowRecord(
+		openRecord2,
+		time.Now(),
+		enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+	)
 
-	// List closed with filtering
-	resp, err5 := s.VisibilityMgr.ListClosedWorkflowExecutionsByWorkflowID(s.ctx, &manager.ListWorkflowExecutionsByWorkflowIDRequest{
-		ListWorkflowExecutionsRequest: &manager.ListWorkflowExecutionsRequest{
-			NamespaceID:       testNamespaceUUID,
-			PageSize:          2,
-			EarliestStartTime: startTime,
-			LatestStartTime:   time.Now(),
-		},
-		WorkflowID: "visibility-filtering-test2",
+	// List closed with filtering: ListClosedWorkflowExecutionsByWorkflowID
+	resp, err5 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    2,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s != '%s' AND %s = '%s'",
+			searchattribute.CloseTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.CloseTime,
+			time.Now().Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+			searchattribute.WorkflowID,
+			"visibility-filtering-test2",
+		),
 	})
 	s.Nil(err5)
 	s.Equal(1, len(resp.Executions))
@@ -453,78 +657,52 @@ func (s *VisibilityPersistenceSuite) TestFilteringByWorkflowID() {
 func (s *VisibilityPersistenceSuite) TestFilteringByStatus() {
 	testNamespaceUUID := namespace.ID(uuid.New())
 	startTime := time.Now()
+	executionTime := startTime
 
 	// Create 2 executions
-	workflowExecution1 := commonpb.WorkflowExecution{
-		WorkflowId: "visibility-filtering-test1",
-		RunId:      "fb15e4b5-356f-466d-8c6d-a29223e5c536",
-	}
-	err0 := s.VisibilityMgr.RecordWorkflowExecutionStarted(s.ctx, &manager.RecordWorkflowExecutionStartedRequest{
-		VisibilityRequestBase: &manager.VisibilityRequestBase{
-			NamespaceID:      testNamespaceUUID,
-			Execution:        &workflowExecution1,
-			WorkflowTypeName: "visibility-workflow",
-			StartTime:        startTime,
-			Status:           enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
-		},
-	})
-	s.Nil(err0)
+	startReq1 := s.createOpenWorkflowRecord(
+		testNamespaceUUID,
+		"visibility-filtering-test1",
+		"visibility-workflow",
+		startTime,
+		executionTime,
+		"test-queue",
+	)
 
-	workflowExecution2 := commonpb.WorkflowExecution{
-		WorkflowId: "visibility-filtering-test2",
-		RunId:      "843f6fc7-102a-4c63-a2d4-7c653b01bf52",
-	}
-	err1 := s.VisibilityMgr.RecordWorkflowExecutionStarted(s.ctx, &manager.RecordWorkflowExecutionStartedRequest{
-		VisibilityRequestBase: &manager.VisibilityRequestBase{
-			NamespaceID:      testNamespaceUUID,
-			Execution:        &workflowExecution2,
-			WorkflowTypeName: "visibility-workflow",
-			StartTime:        startTime,
-			Status:           enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
-		},
-	})
-	s.Nil(err1)
+	startReq2 := s.createOpenWorkflowRecord(
+		testNamespaceUUID,
+		"visibility-filtering-test2",
+		"visibility-workflow",
+		startTime,
+		executionTime,
+		"test-queue",
+	)
 
 	// Close both executions with different status
-	err2 := s.VisibilityMgr.RecordWorkflowExecutionClosed(s.ctx, &manager.RecordWorkflowExecutionClosedRequest{
-		VisibilityRequestBase: &manager.VisibilityRequestBase{
-			NamespaceID:      testNamespaceUUID,
-			Execution:        &workflowExecution1,
-			WorkflowTypeName: "visibility-workflow",
-			StartTime:        startTime,
-			Status:           enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
-		},
-		CloseTime: time.Now(),
-	})
-	s.Nil(err2)
+	closeTime := time.Now().UTC()
+	s.createClosedWorkflowRecord(startReq1, closeTime, enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED)
+	closeRecord2 := s.createClosedWorkflowRecord(
+		startReq2,
+		closeTime,
+		enumspb.WORKFLOW_EXECUTION_STATUS_FAILED,
+	)
 
-	closeReq := &manager.RecordWorkflowExecutionClosedRequest{
-		VisibilityRequestBase: &manager.VisibilityRequestBase{
-			NamespaceID:      testNamespaceUUID,
-			Execution:        &workflowExecution2,
-			WorkflowTypeName: "visibility-workflow",
-			StartTime:        startTime,
-			Status:           enumspb.WORKFLOW_EXECUTION_STATUS_FAILED,
-		},
-		CloseTime:     time.Now(),
-		HistoryLength: 3,
-	}
-	err3 := s.VisibilityMgr.RecordWorkflowExecutionClosed(s.ctx, closeReq)
-	s.Nil(err3)
-
-	// List closed with filtering
-	resp, err4 := s.VisibilityMgr.ListClosedWorkflowExecutionsByStatus(s.ctx, &manager.ListClosedWorkflowExecutionsByStatusRequest{
-		ListWorkflowExecutionsRequest: &manager.ListWorkflowExecutionsRequest{
-			NamespaceID:       testNamespaceUUID,
-			PageSize:          2,
-			EarliestStartTime: startTime,
-			LatestStartTime:   time.Now(),
-		},
-		Status: enumspb.WORKFLOW_EXECUTION_STATUS_FAILED,
+	// List closed with filtering: ListClosedWorkflowExecutionsByStatus
+	resp, err4 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    2,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s = '%s'",
+			searchattribute.CloseTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.CloseTime,
+			time.Now().Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_FAILED,
+		),
 	})
 	s.Nil(err4)
 	s.Equal(1, len(resp.Executions))
-	s.assertClosedExecutionEquals(closeReq, resp.Executions[0])
+	s.assertClosedExecutionEquals(closeRecord2, resp.Executions[0])
 
 	resp, err := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
 		NamespaceID: testNamespaceUUID,
@@ -533,7 +711,7 @@ func (s *VisibilityPersistenceSuite) TestFilteringByStatus() {
 	})
 	s.Nil(err)
 	s.Equal(1, len(resp.Executions))
-	s.assertClosedExecutionEquals(closeReq, resp.Executions[0])
+	s.assertClosedExecutionEquals(closeRecord2, resp.Executions[0])
 }
 
 // TestDelete test
@@ -543,46 +721,40 @@ func (s *VisibilityPersistenceSuite) TestDeleteWorkflow() {
 	testNamespaceUUID := namespace.ID(uuid.New())
 	closeTime := time.Now().UTC()
 	startTime := closeTime.Add(-5 * time.Second)
-	var pendingExecutions []*commonpb.WorkflowExecution
+	executionTime := closeTime.Add(-4 * time.Second)
+	var startRequests []*manager.RecordWorkflowExecutionStartedRequest
 	for i := 0; i < openRows; i++ {
-		workflowExecution := commonpb.WorkflowExecution{
-			WorkflowId: uuid.New(),
-			RunId:      uuid.New(),
-		}
-		pendingExecutions = append(pendingExecutions, &workflowExecution)
-		err0 := s.VisibilityMgr.RecordWorkflowExecutionStarted(s.ctx, &manager.RecordWorkflowExecutionStartedRequest{
-			VisibilityRequestBase: &manager.VisibilityRequestBase{
-				NamespaceID:      testNamespaceUUID,
-				Execution:        &workflowExecution,
-				WorkflowTypeName: "visibility-workflow",
-				StartTime:        startTime,
-				Status:           enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
-			},
-		})
-		s.Nil(err0)
+		startReq := s.createOpenWorkflowRecord(
+			testNamespaceUUID,
+			uuid.New(),
+			"visibility-workflow",
+			startTime,
+			executionTime,
+			"test-queue",
+		)
+		startRequests = append(startRequests, startReq)
 	}
 
 	for i := 0; i < closedRows; i++ {
-		closeReq := &manager.RecordWorkflowExecutionClosedRequest{
-			VisibilityRequestBase: &manager.VisibilityRequestBase{
-				NamespaceID:      testNamespaceUUID,
-				Execution:        pendingExecutions[i],
-				WorkflowTypeName: "visibility-workflow",
-				StartTime:        startTime,
-				Status:           enumspb.WORKFLOW_EXECUTION_STATUS_FAILED,
-			},
-			CloseTime:     closeTime,
-			HistoryLength: 3,
-		}
-		err1 := s.VisibilityMgr.RecordWorkflowExecutionClosed(s.ctx, closeReq)
-		s.Nil(err1)
+		s.createClosedWorkflowRecord(
+			startRequests[i],
+			closeTime,
+			enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+		)
 	}
 
-	resp, err3 := s.VisibilityMgr.ListClosedWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		EarliestStartTime: startTime,
-		LatestStartTime:   closeTime,
-		PageSize:          10,
+	// ListClosedWorkflowExecutions
+	resp, err3 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    10,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s != '%s'",
+			searchattribute.CloseTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.CloseTime,
+			closeTime.Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		),
 	})
 	s.Nil(err3)
 	s.Equal(closedRows, len(resp.Executions))
@@ -596,20 +768,35 @@ func (s *VisibilityPersistenceSuite) TestDeleteWorkflow() {
 		})
 		s.Nil(err4)
 	}
-	resp, err5 := s.VisibilityMgr.ListClosedWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		EarliestStartTime: startTime,
-		LatestStartTime:   closeTime,
-		PageSize:          10,
+
+	// ListClosedWorkflowExecutions
+	resp, err5 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		PageSize:    10,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s' AND %s != '%s'",
+			searchattribute.CloseTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.CloseTime,
+			closeTime.Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		),
 	})
 	s.Nil(err5)
 	s.Equal(0, len(resp.Executions))
 
-	resp, err6 := s.VisibilityMgr.ListOpenWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		EarliestStartTime: startTime,
-		LatestStartTime:   closeTime,
-		PageSize:          10,
+	// ListOpenWorkflowExecutions
+	resp, err6 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s'AND %s = '%s'",
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.StartTime,
+			closeTime.Format(time.RFC3339Nano),
+			searchattribute.ExecutionStatus,
+			enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		),
+		PageSize: 10,
 	})
 	s.Nil(err6)
 	s.Equal(openRows-closedRows, len(resp.Executions))
@@ -622,11 +809,15 @@ func (s *VisibilityPersistenceSuite) TestDeleteWorkflow() {
 		})
 		s.Nil(err7)
 	}
-	resp, err8 := s.VisibilityMgr.ListOpenWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequest{
-		NamespaceID:       testNamespaceUUID,
-		EarliestStartTime: startTime,
-		LatestStartTime:   closeTime,
-		PageSize:          10,
+	resp, err8 := s.VisibilityMgr.ListWorkflowExecutions(s.ctx, &manager.ListWorkflowExecutionsRequestV2{
+		NamespaceID: testNamespaceUUID,
+		Query: fmt.Sprintf("%s >= '%s' AND %s <= '%s'",
+			searchattribute.StartTime,
+			startTime.Format(time.RFC3339Nano),
+			searchattribute.StartTime,
+			closeTime.Format(time.RFC3339Nano),
+		),
+		PageSize: 10,
 	})
 	s.Nil(err8)
 	s.Equal(0, len(resp.Executions))
@@ -702,6 +893,7 @@ func (s *VisibilityPersistenceSuite) TestGetWorkflowExecution() {
 				"visibility-workflow-test",
 				"visibility-workflow",
 				startTime,
+				startTime,
 				"test-queue",
 			),
 		)
@@ -720,7 +912,10 @@ func (s *VisibilityPersistenceSuite) TestGetWorkflowExecution() {
 
 	var closeRequests []*manager.RecordWorkflowExecutionClosedRequest
 	for _, startReq := range startRequests {
-		closeRequests = append(closeRequests, s.createClosedWorkflowRecord(startReq, closeTime))
+		closeRequests = append(
+			closeRequests,
+			s.createClosedWorkflowRecord(startReq, closeTime, enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED),
+		)
 	}
 	for _, req := range closeRequests {
 		resp, err := s.VisibilityMgr.GetWorkflowExecution(
@@ -743,11 +938,23 @@ func (s *VisibilityPersistenceSuite) TestAdvancedVisibilityPagination() {
 	var startReqs []*manager.RecordWorkflowExecutionStartedRequest
 	var closeReqs []*manager.RecordWorkflowExecutionClosedRequest
 	for i := 0; i < 5; i++ {
-		startReq := s.createOpenWorkflowRecord(testNamespaceUUID, fmt.Sprintf("advanced-visibility-%v", i), "visibility-workflow", time.Now(), "test-queue")
+		startTime := time.Now()
+		startReq := s.createOpenWorkflowRecord(
+			testNamespaceUUID,
+			fmt.Sprintf("advanced-visibility-%v", i),
+			"visibility-workflow",
+			startTime,
+			startTime,
+			"test-queue",
+		)
 		if i <= 1 {
 			startReqs = append([]*manager.RecordWorkflowExecutionStartedRequest{startReq}, startReqs...)
 		} else {
-			closeReq := s.createClosedWorkflowRecord(startReq, time.Now())
+			closeReq := s.createClosedWorkflowRecord(
+				startReq,
+				time.Now(),
+				enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+			)
 			closeReqs = append([]*manager.RecordWorkflowExecutionClosedRequest{closeReq}, closeReqs...)
 		}
 	}
@@ -788,6 +995,7 @@ func (s *VisibilityPersistenceSuite) TestCountWorkflowExecutions() {
 			"visibility-workflow-test",
 			"visibility-workflow",
 			startTime,
+			startTime,
 			"test-queue",
 		)
 	}
@@ -818,6 +1026,7 @@ func (s *VisibilityPersistenceSuite) TestCountGroupByWorkflowExecutions() {
 				"visibility-workflow-test",
 				"visibility-workflow",
 				startTime,
+				startTime,
 				"test-queue",
 			),
 		)
@@ -847,7 +1056,11 @@ func (s *VisibilityPersistenceSuite) TestCountGroupByWorkflowExecutions() {
 	)
 
 	for i := 0; i < 2; i++ {
-		s.createClosedWorkflowRecord(startRequests[i], closeTime)
+		s.createClosedWorkflowRecord(
+			startRequests[i],
+			closeTime,
+			enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+		)
 	}
 
 	resp, err = s.VisibilityMgr.CountWorkflowExecutions(
@@ -888,17 +1101,22 @@ func (s *VisibilityPersistenceSuite) listWithPagination(namespaceID namespace.ID
 func (s *VisibilityPersistenceSuite) createClosedWorkflowRecord(
 	startReq *manager.RecordWorkflowExecutionStartedRequest,
 	closeTime time.Time,
+	status enumspb.WorkflowExecutionStatus,
 ) *manager.RecordWorkflowExecutionClosedRequest {
+	s.taskID++
 	closeReq := &manager.RecordWorkflowExecutionClosedRequest{
 		VisibilityRequestBase: &manager.VisibilityRequestBase{
 			NamespaceID:      startReq.NamespaceID,
 			Execution:        startReq.Execution,
 			WorkflowTypeName: startReq.WorkflowTypeName,
 			StartTime:        startReq.StartTime,
-			Status:           enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+			ExecutionTime:    startReq.ExecutionTime,
+			Status:           status,
+			TaskID:           s.taskID,
 		},
-		CloseTime:     closeTime,
-		HistoryLength: 5,
+		CloseTime:         closeTime,
+		ExecutionDuration: closeTime.Sub(startReq.ExecutionTime),
+		HistoryLength:     5,
 	}
 	err := s.VisibilityMgr.RecordWorkflowExecutionClosed(s.ctx, closeReq)
 	s.Nil(err)
@@ -910,8 +1128,10 @@ func (s *VisibilityPersistenceSuite) createOpenWorkflowRecord(
 	workflowID string,
 	workflowType string,
 	startTime time.Time,
+	executionTime time.Time,
 	taskQueue string,
 ) *manager.RecordWorkflowExecutionStartedRequest {
+	s.taskID++
 	workflowExecution := commonpb.WorkflowExecution{
 		WorkflowId: workflowID,
 		RunId:      uuid.New(),
@@ -922,8 +1142,10 @@ func (s *VisibilityPersistenceSuite) createOpenWorkflowRecord(
 			Execution:        &workflowExecution,
 			WorkflowTypeName: workflowType,
 			StartTime:        startTime,
+			ExecutionTime:    executionTime,
 			Status:           enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
 			TaskQueue:        taskQueue,
+			TaskID:           s.taskID,
 		},
 	}
 	err := s.VisibilityMgr.RecordWorkflowExecutionStarted(s.ctx, startReq)

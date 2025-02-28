@@ -30,14 +30,16 @@ import (
 
 	"github.com/nexus-rpc/sdk-go/nexus"
 	commonpb "go.temporal.io/api/common/v1"
+	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/server/common/persistence/serialization"
 )
 
-type PayloadSerializer struct{}
+type payloadSerializer struct{}
 
 var errSerializer = errors.New("serializer error")
 
 // Deserialize implements nexus.Serializer.
-func (PayloadSerializer) Deserialize(content *nexus.Content, v any) error {
+func (payloadSerializer) Deserialize(content *nexus.Content, v any) error {
 	payloadRef, ok := v.(**commonpb.Payload)
 	if !ok {
 		return fmt.Errorf("%w: cannot deserialize into %v", errSerializer, v)
@@ -79,7 +81,7 @@ func (PayloadSerializer) Deserialize(content *nexus.Content, v any) error {
 	case "application/x-temporal-payload":
 		err := payload.Unmarshal(content.Data)
 		if err != nil {
-			return err
+			return serialization.NewDeserializationError(enumspb.ENCODING_TYPE_PROTO3, err)
 		}
 	case "application/json":
 		if len(params) == 0 {
@@ -117,17 +119,19 @@ func setUnknownNexusContent(nexusHeader nexus.Header, payloadMetadata map[string
 }
 
 // Serialize implements nexus.Serializer.
-func (PayloadSerializer) Serialize(v any) (*nexus.Content, error) {
+func (payloadSerializer) Serialize(v any) (*nexus.Content, error) {
 	payload, ok := v.(*commonpb.Payload)
 	if !ok {
 		return nil, fmt.Errorf("%w: cannot serialize %v", errSerializer, v)
 	}
 
+	// Use the "nil" Nexus Content representation for nil Payloads.
 	if payload == nil {
-		return &nexus.Content{}, nil
+		// Use same structure as the nil serializer from the Nexus Go SDK.
+		return &nexus.Content{Header: nexus.Header{}}, nil
 	}
 
-	if payload.GetMetadata() == nil {
+	if len(payload.GetMetadata()) == 0 {
 		return xTemporalPayload(payload)
 	}
 
@@ -182,4 +186,4 @@ func xTemporalPayload(payload *commonpb.Payload) (*nexus.Content, error) {
 	}, nil
 }
 
-var _ nexus.Serializer = PayloadSerializer{}
+var PayloadSerializer nexus.Serializer = payloadSerializer{}
