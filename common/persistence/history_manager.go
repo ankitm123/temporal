@@ -915,6 +915,7 @@ func (m *executionManagerImpl) readHistoryBranch(
 	dataLossTags := func(cause string) []tag.Tag {
 		return []tag.Tag{
 			tag.Cause(cause),
+			tag.ShardID(request.ShardID),
 			tag.WorkflowBranchToken(request.BranchToken),
 			tag.WorkflowFirstEventID(firstEvent.GetEventId()),
 			tag.FirstEventVersion(firstEvent.GetVersion()),
@@ -1082,7 +1083,11 @@ func (m *executionManagerImpl) filterHistoryNodesReverse(
 		if lastNodeID == defaultLastNodeID {
 			lastNodeID = node.NodeID
 		}
-		if node.TransactionID != lastTransactionID {
+		if lastTransactionID == 0 {
+			m.logger.Warn("lastTransactionID is not set, this should not happen")
+		}
+		if lastTransactionID != 0 && // in the case where the lastTransactionID is not set, we will not compare
+			node.TransactionID != lastTransactionID {
 			continue
 		}
 
