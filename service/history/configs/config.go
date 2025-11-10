@@ -344,10 +344,11 @@ type Config struct {
 	ESProcessorFlushInterval          dynamicconfig.DurationPropertyFn
 	ESProcessorAckTimeout             dynamicconfig.DurationPropertyFn
 
-	EnableCrossNamespaceCommands  dynamicconfig.BoolPropertyFn
-	EnableActivityEagerExecution  dynamicconfig.BoolPropertyFnWithNamespaceFilter
-	EnableEagerWorkflowStart      dynamicconfig.BoolPropertyFnWithNamespaceFilter
-	NamespaceCacheRefreshInterval dynamicconfig.DurationPropertyFn
+	EnableCrossNamespaceCommands      dynamicconfig.BoolPropertyFn
+	EnableActivityEagerExecution      dynamicconfig.BoolPropertyFnWithNamespaceFilter
+	EnableActivityRetryStampIncrement dynamicconfig.BoolPropertyFn
+	EnableEagerWorkflowStart          dynamicconfig.BoolPropertyFnWithNamespaceFilter
+	NamespaceCacheRefreshInterval     dynamicconfig.DurationPropertyFn
 
 	// ArchivalQueueProcessor settings
 	ArchivalProcessorSchedulerWorkerCount               dynamicconfig.TypedSubscribable[int]
@@ -387,6 +388,9 @@ type Config struct {
 	MaxLocalParentWorkflowVerificationDuration dynamicconfig.DurationPropertyFn
 
 	NumConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute dynamicconfig.IntPropertyFnWithNamespaceFilter
+
+	// Worker-Versioning related settings
+	UseRevisionNumberForWorkerVersioning dynamicconfig.BoolPropertyFnWithNamespaceFilter
 }
 
 // NewConfig returns new service config with default values
@@ -691,10 +695,11 @@ func NewConfig(
 		ESProcessorFlushInterval: dynamicconfig.WorkerESProcessorFlushInterval.Get(dc),
 		ESProcessorAckTimeout:    dynamicconfig.WorkerESProcessorAckTimeout.Get(dc),
 
-		EnableCrossNamespaceCommands:  dynamicconfig.EnableCrossNamespaceCommands.Get(dc),
-		EnableActivityEagerExecution:  dynamicconfig.EnableActivityEagerExecution.Get(dc),
-		EnableEagerWorkflowStart:      dynamicconfig.EnableEagerWorkflowStart.Get(dc),
-		NamespaceCacheRefreshInterval: dynamicconfig.NamespaceCacheRefreshInterval.Get(dc),
+		EnableCrossNamespaceCommands:      dynamicconfig.EnableCrossNamespaceCommands.Get(dc),
+		EnableActivityEagerExecution:      dynamicconfig.EnableActivityEagerExecution.Get(dc),
+		EnableActivityRetryStampIncrement: dynamicconfig.EnableActivityRetryStampIncrement.Get(dc),
+		EnableEagerWorkflowStart:          dynamicconfig.EnableEagerWorkflowStart.Get(dc),
+		NamespaceCacheRefreshInterval:     dynamicconfig.NamespaceCacheRefreshInterval.Get(dc),
 
 		// Archival related
 		ArchivalTaskBatchSize:                               dynamicconfig.ArchivalTaskBatchSize.Get(dc),
@@ -733,6 +738,9 @@ func NewConfig(
 		LogAllReqErrors: dynamicconfig.LogAllReqErrors.Get(dc),
 
 		NumConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute: dynamicconfig.NumConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute.Get(dc),
+
+		// Worker-Versioning related
+		UseRevisionNumberForWorkerVersioning: dynamicconfig.UseRevisionNumberForWorkerVersioning.Get(dc),
 	}
 
 	return cfg
